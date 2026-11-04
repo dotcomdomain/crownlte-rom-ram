@@ -34,10 +34,11 @@ EXTRA_FILES = ['/init.environ.rc', '/system/build.prop', '/vendor/build.prop', '
 EMPTY = {
     '/vendor/etc/init/vendor_flash_recovery.rc': 'service runs /vendor/bin/install-recovery.sh (rewrites RECOVERY)',
     '/system/etc/init/misctrl.rc': 'service misctrl (root, writes the misc partition)',
+    '/system/etc/init/uncrypt.rc': 'services uncrypt/setup-bcb/clear-bcb (write the misc partition BCB)',
 }
 DISARM_CMDS = {'mount_all', 'swapon_all', 'umount_all', 'remount_userdata'}
 DANGER_BINS = re.compile(r'(install-recovery|flash_recovery|misctrl|e2fsck|fsck|mke2fs|make_f2fs|mkfs|'
-                         r'resize2fs|tune2fs|sgdisk|blkdiscard|sload_f2fs|e2fsdroid|^dd$)')
+                         r'resize2fs|tune2fs|sgdisk|blkdiscard|sload_f2fs|e2fsdroid|uncrypt|^dd$)')
 INIT_USER0 = '    exec u:r:su:s0 root root -- /system/bin/sh /dev/crownlte/init_user0.sh'
 CMDLINE_EXTRA = ('androidboot.hardware=samsungexynos9810 androidboot.selinux=permissive '
                  'androidboot.init_rc=/dev/crownlte/init.diag.rc androidboot.mode=normal '

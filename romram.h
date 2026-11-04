@@ -561,6 +561,46 @@ static int romram_child(void *unused)
                 rr_log("UFS host bound with crownlte,read-only-diagnostic (SCSI write guard armed)");
         }
 
+        /*
+         * 1b. Never run Lineage against a live Trustonic TEE: mcDriverDaemon +
+         * keymaster could upgrade or rewrap keys (irreversible for 4.9). Refuse
+         * if any TEE device node exists or the TEE driver bound a device.
+         */
+        {
+                static const char *const tee_paths[] = {
+                        "/dev/mobicore", "/dev/mobicore-user",
+                        "/sys/class/misc/mobicore", "/sys/class/misc/mobicore-user",
+                        "/sys/bus/platform/drivers/mcd/tee",
+                };
+                struct stat st;
+                stage = "tee-must-be-off";
+                for (unsigned int t = 0; t < sizeof(tee_paths) / sizeof(tee_paths[0]); t++)
+                        if (!lstat(tee_paths[t], &st)) {
+                                rr_log("Trustonic TEE present (%s); refusing ROM-in-RAM", tee_paths[t]);
+                                error = -EPERM;
+                                goto out;
+                        }
+                if (!lstat("/sys/firmware/devicetree/base/tee/status", &st)) {
+                        char status[16] = "";
+                        int fd = open("/sys/firmware/devicetree/base/tee/status", O_RDONLY | O_CLOEXEC);
+                        if (fd >= 0) {
+                                ssize_t n = read(fd, status, sizeof(status) - 1);
+                                close(fd);
+                                if (n > 0) status[n] = 0;
+                        }
+                        if (!strncmp(status, "okay", 4) || !strncmp(status, "ok", 2)) {
+                                rr_log("DT /tee status=%s; refusing ROM-in-RAM", status);
+                                error = -EPERM;
+                                goto out;
+                        }
+                } else if (!lstat("/sys/firmware/devicetree/base/tee", &st)) {
+                        rr_log("DT /tee node without status (defaults to okay); refusing ROM-in-RAM");
+                        error = -EPERM;
+                        goto out;
+                }
+                rr_log("Trustonic TEE absent (no /dev/mobicore*, DT /tee not okay)");
+        }
+
         /* 2. Wait (bounded) for the three partitions, then read-only every sd*. */
         stage = "wait-partitions";
         for (int attempt = 0;; attempt++) {
