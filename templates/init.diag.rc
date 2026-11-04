@@ -1,0 +1,62 @@
+# crownlte ROM-in-RAM diagnostic boot script, selected via
+# androidboot.init_rc=/dev/crownlte/init.diag.rc (ro.boot.init_rc).
+# Parses the same files as init's default LoadBootScripts, in the same order.
+# Every rc file reachable here was sha256-verified by the namespace child and
+# the few sanitized ones are bind-mounted read-only over the originals.
+import /system/etc/init/hw/init.rc
+import /system/etc/init
+import /system_ext/etc/init
+import /vendor/etc/init
+import /odm/etc/init
+import /product/etc/init
+
+on early-init
+    write /dev/kmsg "<6>crownlte-romram: Lineage init second stage reached early-init"
+
+on init
+    start crownlte_probe
+
+# mount_all is disarmed (it would mount USERDATA/EFS/CACHE rw and fsck them).
+# Publish the state mount_all reports for a non-encrypted /data, which is what
+# a RAM /data is, so the normal class_start main/late_start path still runs.
+on fs
+    write /dev/kmsg "<6>crownlte-romram: on fs (mount_all disarmed; /data is tmpfs)"
+    setprop ro.crypto.state unencrypted
+    trigger nonencrypted
+
+on post-fs
+    start crownlte_logcat
+
+on property:logd.ready=true
+    start crownlte_logcat
+
+on post-fs-data
+    write /dev/kmsg "<6>crownlte-romram: post-fs-data reached"
+
+on property:init.svc.derive_classpath=running
+    write /dev/kmsg "<6>crownlte-romram: derive_classpath running"
+
+on property:init.svc.derive_classpath=stopped
+    write /dev/kmsg "<6>crownlte-romram: derive_classpath stopped"
+
+on zygote-start
+    write /dev/kmsg "<6>crownlte-romram: zygote-start reached"
+
+on property:init.svc.zygote=running
+    write /dev/kmsg "<6>crownlte-romram: zygote running"
+
+on property:sys.boot_completed=1
+    write /dev/kmsg "<6>crownlte-romram: sys.boot_completed=1"
+
+service crownlte_probe /system/bin/sh /dev/crownlte/probe.sh
+    user root
+    group root readproc log
+    seclabel u:r:su:s0
+    disabled
+    oneshot
+
+service crownlte_logcat /system/bin/logcat -b all -v threadtime -f /dev/crownlte/logcat.txt -r 262144 -n 1
+    user root
+    group root log readproc
+    seclabel u:r:su:s0
+    disabled
