@@ -111,3 +111,126 @@ Windows copy: `C:\Users\Patrick\tools\trial-romram-20261104\recovery.img`.
 - In Lineage: `/sys/fs/pstore/` as usual. Lineage-in-RAM cannot write /dev/pmsg0 (shadowed), so pmsg keeps the
   kernel tail.
 - Restore bright RECOVERY (8763860c) and wait for boot=booted as usual.
+
+---
+
+# v4 (q47 kernel, no fbcon/VT): ROM-in-RAM on the hardware-verified display kernel (2026-11-04)
+
+Supersedes v3 (`pack-romram-20261104c`, recovery ff972eac). The v3 sections above (frames, timeline, container
+exit codes, deviations, blocker list) still apply. This section covers only the differences and the new display
+milestones.
+
+Image: gekko `rom-ram/pack-romram-20261104d/recovery.img`
+sha256 `2fc2756aa4fd4f88002232c0c30a4c04a94ee76622d98409abb11bb9e1533fcf` (68,149,248 bytes).
+Windows: `C:\Users\Patrick\tools\trial-romram-20261104\v4-q47\recovery.img` (+ manifest.json, hash verified).
+
+| input | sha256 |
+|---|---|
+| kernel Image: crownlte-display-flipfix e39c11f1e (= q47 source), q47 config with CONFIG_VT=n, build/romram-6.12.93 | f5e46ef73342ab0181c34a7929cb49e893da1460cc4bb20db407514104a21e28 |
+| .config (snapshot build/romram-6.12.93/v4/config) | 69518817c3e0abac54223269d59d01366e2a4f5d5fecf2481b6cb8ed4f1dec39 |
+| DTB exynos9810-crownlte-romram.dtb (rom-ram src 6b2bfb5 dts/, on top of the q47 combined DTS 4530f0c5) | 8c5ec543fd753e7addc3bc37777765a5628a8dc109e7f1c99882507a234bc18a |
+| ramdisk rom-ram/build-3/diagnostic-initramfs.cpio.gz (src 6b2bfb5) | cd8dbf8c14bc97e6fed91d9a736bda7585d17d37553bf2307ba2926779e36298 |
+| shim bbea959 (loader) | 42a66811f0b7adcf24706e7291bacbca86963f4c35946f8136db61012a107d5d |
+| restore image (bright RECOVERY) | 8763860c11a272cb6c341f2fc561e38adb5ea621a16ef7a5b083d9b6d28a8a0e |
+
+## What changed vs v3
+- Kernel: q25 integration 31caf697c (Image a3f7f56f) -> crownlte-display-flipfix e39c11f1e. This is the q45/q47
+  hardware-verified set: ACPM DVFS/cpufreq/devfreq/TMU, PMIC+RTC read-only (RTC read latch), watchdog + restart
+  guard, DECON stage 2 adopt with WIN_CONFIG and a verified active IDMA base, panel brightness 44700 at 1 s, Mali
+  r38p1 with the runtime G3D domain, SoC ADC + MAX77705 read-only battery, MCT broadcast. The TEE and touch drivers
+  are built, but their DT nodes are disabled.
+- Config vs q47: `VT` y->n. This also drops FRAMEBUFFER_CONSOLE, VT_CONSOLE(_SLEEP), VT_HW_CONSOLE_BINDING,
+  DUMMY_CONSOLE, CONSOLE_TRANSLATIONS and the FONTS menu (FONT_TER16x32 goes; FONT_AUTOSELECT/8x16 stay).
+  Reason: fbcon printk with IRQs off cost 20-130 ms per line (in q46 the brightness window took 4.9 s and the MCT
+  probe was refused). 4.9 had no VT.
+  Config vs v3 (taken from the v3 image's IKCONFIG): only additions (cpuidle + MCT broadcast + menu governor,
+  NO_HZ_IDLE, DPU fbdev + panel RO backlight, IIO + EXYNOS_ADC, MAX77705 battery RO, Mali midgard r38p1,
+  SEC_TS touch driver) plus the VT/fbcon removal. Nothing ROM-RAM needs was lost. Binder/binderfs, memfd, dm, loop,
+  erofs/f2fs/ext4, SELinux, seccomp, userfaultfd, PSI, dma-buf heaps, sync_file, uhid and evdev are unchanged.
+- DTB vs q47 combined (4530f0c5): removed `samsung,decon-selftest` (HWC owns WIN_CONFIG), `samsung,cpuidle-selftest`
+  (+soak), `samsung,mali-selftest` (+selftest-khz), `samsung,cpufreq-selftest` and `samsung,devfreq-selftest`. The
+  model string is new. The decompiled diff shows nothing else.
+  Kept:
+  - UFS `crownlte,read-only-diagnostic` (held first probe + SCSI write guard). The UFS node is identical to v3
+    apart from phandle numbers, and drivers/ufs is unchanged since 31caf697c.
+  - Stage 2 adopt + `samsung,fb-takeover`, and brightness 44700 at 1000 ms.
+  - Watchdog `samsung,start-at-boot`, 30 s, pinged by the kernel. No expiry test.
+  - Read-only reports: MCT at 86 s, TMU, PMIC/RTC at 106 s, ADC at 104 s, battery at 107 s.
+  - TEE, touch, DPU SysMMU and the handover helper stay disabled; bootargs stay `panic=30 ro`.
+  **C2 cpuidle is OFF (WFI only).** The driver arms C2 only from the staged self-test or from
+  `samsung,c2-boot-cpus`, and the boot path is always refused. cpuidle/ links before clocksource/, so when cpuidle
+  probes, the MCT broadcast is not ready yet. Big-only C2 without the self-test needs a kernel change (arm once the
+  MCT is ready, or from a late initcall).
+- Ramdisk: only `/init` changed (src 6b2bfb5). Without a console tty, the kernel cannot open /dev/console for PID1.
+  fds 0-2 then start closed, and the kmsg/serial fds could become stdio (announce() writes every line to fd 2).
+  PID1 now pins fds 0-2 to /dev/null. Everything else is byte-identical to v3: the payload, the manifest (139 files,
+  5b3170e6), the rc overlays (uncrypt EMPTY, mount_all disarmed, ...), the TEE refusal and all ROM-stage checks.
+
+## How to run
+Same procedure and frames as v3. Capture to a separate output file:
+```
+powershell -ExecutionPolicy Bypass -File C:\Users\Patrick\tools\trial-romram-20261104\romram-capture.ps1 -Out C:\Users\Patrick\tools\trial-romram-20261104\v4-q47\serial-romram-v4.bin
+```
+The script runs 330 s by default. It sends READY, then PROBE + CROWNLTE-ROMRAM-START-1 after `probe remains held`.
+The run takes about 5.5 min, followed by the normal Lineage boot. Someone should watch the screen, because the
+display result can only be judged visually.
+
+## Expected milestones (serial, in order)
+Kernel, first seconds (printk time):
+- `adopted: win.. dpp.. IDMA format .. at 0xcc000000`, `fb0 takeover: ... latched after .. us`,
+  `adopt mode ready: TE irq N, fb0 window owned`. No `decon selftest:` line should appear.
+- `panel-bright: start at 1.0xx s`, then `panel-bright: RESULT PASS ... brightness 44700, read-back ...`.
+  No console prints with IRQs off any more, so the window should stay well under 1 s (q47: 718 ms). On the panel,
+  the flicker should stop at about 1 s.
+- `exynos9810-mct-bc: tick broadcast device registered` and `exynos9810-cpuidle: registered: ... C2 disarmed on
+  every CPU`. No `cpuidle selftest: scheduled` line should appear.
+- `watchdog active, reset enabled ...`, `mali exynos9810: GPU_ID ...` and `G3D power control "runtime"`.
+  No `mali selftest: armed` line should appear. Then `diagnostic first probe held for USB host`.
+- "Warning: unable to open an initial console." is expected (no VT).
+
+PID1:
+- New: `crownlte-diag: no /dev/console (errno=19, kernel without VT); stdio pinned to /dev/null fd0=1 fd1=1 fd2=1`.
+- Then the v3 sequence: gadget bound, `probe remains held`, PROBE, `UFS probe child reaped status=0 ok=1`, and the
+  ROM stage (`Trustonic TEE absent`, `BLKROSET=1 verified`, 3 ro mounts, `manifest verified: 139 files`, overlays,
+  masks, `exec /system/bin/init selinux_setup`).
+
+Lineage (markers from init.diag.rc, then `L;` logcat and `P;` probe lines):
+- secilc + policy load (10-40 s), `second stage reached early-init`, `on fs`, `post-fs-data`, `zygote-start`.
+- Display (new in v4), read from `L;`/`P;` and the kernel lines:
+  1. ueventd creates `/dev/graphics/fb0` and `/dev/mali0`. `P;` getprop shows `init.svc.vendor.hwcomposer-3`
+     (HWC3 slsi), `init.svc.vendor.gralloc-2-0` and `init.svc.surfaceflinger` = running.
+  2. HWC opens fb0. Blank/power-mode requests are accepted and ignored (`blank N ignored (adopt mode, no panel
+     driver)`), so Android cannot switch the panel off. Vsync comes from TE.
+  3. WIN_CONFIG commits. Likely blocker: gralloc (libion_exynos, via /dev/dma_heap) hands out scattered system-heap
+     buffers, and without the DPU SysMMU the driver refuses them. The kernel logs `buffer not contiguous (segment
+     N); needs the DPU SysMMU` and `win.. rejected (...)`. A rejected config is not applied, so the panel keeps the
+     last good frame (the SBoot image). This is a known, safe outcome. The fix is the dpu-iommu work (q28).
+  4. If commits are accepted (contiguous/CMA buffers): `init.svc.bootanim=running` and the boot animation shows on
+     the panel.
+- `sys.boot_completed=1` is the stretch goal. `P;CROWNLTE-BYPASS ...` lines mark keystore/odsign blockers, as in v3.
+- Kernel read-only reports interleave at about 86 s (MCT) and 104-107 s (ADC, battery, TMU, PMIC/RTC). They are
+  harmless.
+- adb: **not expected.** PID1's ACM gadget owns the only UDC, so Android's `write /config/usb_gadget/g1/UDC` fails
+  (EBUSY) and the serial link stays up. All observation goes over serial (`L;`, `P;`, kernel).
+- Touch: disabled, so there is no input.
+
+## Success levels
+1. Kernel, PID1 and the ROM stage reach `exec /system/bin/init selinux_setup` with `Trustonic TEE absent`, and the
+   write guard rejects nothing unexpected.
+2. Lineage reaches zygote/system_server (`zygote running`).
+3. surfaceflinger + HWC are running, fb0 is opened, and WIN_CONFIG attempts are visible (accepted, or rejected with
+   the reason).
+4. The boot animation shows on the panel (needs contiguous buffers) and/or `sys.boot_completed=1`.
+The panel flicker stopping at about 1 s is a pass on its own (owner-visible).
+
+## Abort / return path
+- Normal: container SIGKILL at 275 s, then the independent timer restarts at 300 s through the watchdog restart
+  guard (`restart: armed for 30 s and no longer petted`). Shim bbea959 then boots normally into Lineage (4.9, BOOT).
+- Kernel hang: the CL0 watchdog (30 s, pinged by the kernel) resets the phone. Android cannot open /dev/watchdog*
+  (shadowed). After a panic, `panic=30` reboots.
+- Stuck with no reset: hold Power + Volume Down for about 10 s. If the phone loops into RECOVERY, use Odin with
+  bright-recovery.tar.
+- After return: save the serial log and read `/sys/fs/pstore/` as usual. Restore bright RECOVERY (8763860c) and
+  wait for boot=booted (~8 min) before the next reboot.
+- Never run this with a TEE-enabled DTB. The ROM stage refuses it anyway (`Trustonic TEE present` /
+  `DT /tee status=okay`).
