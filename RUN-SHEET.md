@@ -697,3 +697,70 @@ powershell -ExecutionPolicy Bypass -File C:\Users\Patrick\tools\trial-romram-202
 ## Abort / return path
 Unchanged: container SIGKILL at 575 s, restart at 600 s, watchdog/panic fallbacks, then restore bright RECOVERY
 (8763860c).
+
+---
+
+# v14: linear HWC client target (ro.vendor.ddk.set.afbc=0) on display kernel 15b1c256c (2026-11-05)
+
+Builds on v11 (recovery d888449d: sys.boot_completed=1, SystemUI and launcher3 up) and the owner's v12/v13
+display-kernel runs, in which the panel was black during keyguard. q48 proved that every window/channel reaches the
+panel, so the suspect is AFBC decoding of the HWC client target.
+
+Image: gekko `rom-ram/pack-romram-20261105a/recovery.img`
+sha256 `d8a47b079d79492b53c34fe9e97587da003cfcd3b8194ca5aad9fa72518b3ca0` (68,149,248 bytes).
+Windows: `C:\Users\Patrick\tools\trial-romram-20261104\v14\recovery.img` (+ manifest.json, hash verified).
+
+| input | sha256 |
+|---|---|
+| kernel Image: crownlte-display-flipfix 15b1c256c (display agent; in Sol review; not rebuilt), snapshot build/romram-6.12.93/v14/ | b65ff284d67252c0d4647353d383d4b650cdd318e48c22f4cececa4ecd96b8d6 |
+| .config (= v9) | cc02f2ea7b8d7cf8d57c2a8140afb2a3f2433a0071da5cf77577b9fde75b4b4f |
+| DTB (as v7-v11) | a6a888a8b7c92b1242949e43a74791c6ff492407595dd65fcfa3698e223f3ac4 |
+| ramdisk rom-ram/build-8 (src ed0813d) | 18279f131d7441c25cd8bc8d1b7dfc9afecb814e74765dace9056f4361da74be |
+| /init (unchanged since v10) | 8c7545800448d2d5ef0ef705281338c7ecb5de4c61ebb6373fd705cb23accb33 |
+| payload manifest (153 entries, 149 hashed, 7 replacements) | ae90ab38d936d5faf471fd0ba1bdd4d27dac68fa7e67e22e303e5245c57fcf9d |
+| vendor build.prop: original (verified) / replacement | 00aa1914... / c218ba0d1dab4badf233e5e29ca7bbd789baaaa0f8695e8eb4dee3053f409a4c |
+| shim bbea959 (loader) | 9e8b9e345a489b7c109e8de6f686703e649d5fff90493fd4bc7bdf98292e7aa3 |
+
+## Change (rom-ram src e8c5f72..ed0813d; no kernel commits from this agent)
+- **gen_payload.py, PROP_SET:** `/vendor/build.prop` (already a sha256-verified `keep` entry) becomes a replacement
+  that differs only in line 70: `ro.vendor.ddk.set.afbc=1` -> `=0`. The ROM stage bind-mounts it read-only over
+  the original before init, so init's first and only value is 0. The generator refuses unless:
+  - the key is defined exactly once in that file with the expected old value;
+  - exactly those lines change;
+  - no other prop file init loads (system, system_ext, product, prop.default, vendor default.prop, odm) defines
+    the key. Today it exists only at vendor/build.prop:70.
+- **Readers of the property:** libexynosdisplay.so (HWC, client composition) and gralloc.universal9810.so (64/32-bit),
+  plus libGrallocMapperCamera.so.
+- **Evidence lines:**
+  - `probe.sh` (first probe): `--- afbc ro.vendor.ddk.set.afbc=0`;
+  - `init.diag.rc`: kmsg `crownlte-romram: ro.vendor.ddk.set.afbc=0`.
+- **Unchanged:** init.c and romram.h (FRP RAM copy, TEE refusal, storage guards), all v6-v11 overlays.
+
+Checks run:
+- The ramdisk build passes the host verifier (positive + 3 negatives).
+- Manifest delta vs v11: only `/vendor/build.prop keep -> replace:prop_a338da37ac40683d.prop` and its `R` line.
+- `diff` of the original vs replacement: exactly 1 changed line (70).
+- Negative test: a wrong expected old value aborts generation (`PROP ... line is 'ro.vendor.ddk.set.afbc=1', expected ...=9`).
+- Image, DTB and ramdisk are each embedded once; IKCONFIG = the v14 snapshot config; the Windows copy hash matches.
+
+## How to run
+As v6-v11 (600 s):
+```
+powershell -ExecutionPolicy Bypass -File C:\Users\Patrick\tools\trial-romram-20261104\romram-capture.ps1 -Seconds 630 -Out C:\Users\Patrick\tools\trial-romram-20261104\v14\serial-romram-v14.bin
+```
+`C:\Users\Patrick\tools\run-trial.sh` refuses to start trials after 2026-11-05 06:10. Do not edit it during a trial.
+
+## Expected milestones
+- ROM stage:
+  - `manifest verified: 149 files hashed`;
+  - `rc overlay /vendor/build.prop -> replace`;
+  - the FRP lines as in v10/v11.
+- kmsg `crownlte-romram: ro.vendor.ddk.set.afbc=0`; first probe `--- afbc ro.vendor.ddk.set.afbc=0`.
+- DECON bounce lines: the HWC client target arrives with `comp 0` (linear, no AFBC).
+- Boot as in v11 (sys.boot_completed=1, SystemUI, launcher3), with the keyguard/launcher **visible** on the panel
+  instead of black. Colours should be right with the 15b1c256c format-layout fix.
+- If it is still black with `comp 0`, AFBC is ruled out and the problem is in the linear bounce or the format path.
+
+## Abort / return path
+Unchanged: container SIGKILL at 575 s, restart at 600 s, watchdog/panic fallbacks, then restore bright RECOVERY
+(8763860c).
