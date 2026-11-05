@@ -34,7 +34,9 @@ EXTRA_FILES = ['/init.environ.rc', '/system/build.prop', '/vendor/build.prop', '
                # v6: TEE client chokepoints and VINTF manifests (see EMPTY / VINTF_DROP)
                '/vendor/lib64/hw/keystore.mdfpp.so', '/vendor/lib64/libMcClient.so',
                '/vendor/lib/libMcClient.so', '/vendor/etc/vintf/manifest.xml',
-               '/vendor/etc/vintf/manifest/android.hardware.biometrics.fingerprint-service.samsung.xml']
+               '/vendor/etc/vintf/manifest/android.hardware.biometrics.fingerprint-service.samsung.xml',
+               # v11: feature file whose service would wait for an absent HAL (see FEATURE_DROP)
+               '/vendor/etc/permissions/android.hardware.fingerprint.xml']
 EMPTY = {
     '/vendor/etc/init/vendor_flash_recovery.rc': 'service runs /vendor/bin/install-recovery.sh (rewrites RECOVERY)',
     '/system/etc/init/misctrl.rc': 'service misctrl (root, writes the misc partition)',
@@ -56,14 +58,32 @@ EMPTY = {
         'software-only implementation."; km_compat then uses that insecure HAL as the TEE device',
     '/vendor/lib64/libMcClient.so': 'Trustonic client library (64-bit): every TEE client fails to load',
     '/vendor/lib/libMcClient.so': 'Trustonic client library (32-bit): every TEE client fails to load',
+    # v11: Lineage HALs whose hardware nodes do not exist on 6.12. They keep
+    # running but register nothing, so LineageHardwareManager's
+    # waitForDeclaredService() blocked system_server's main thread (Watchdog).
+    '/vendor/etc/init/vendor.lineage.touch-service.samsung.rc':
+        'service vendor.touch-hal (needs /sys/class/sec/tsp/cmd, /sys/class/sec/sec_epen; touch is off in the DT)',
+    '/vendor/etc/init/vendor.lineage.livedisplay-service.samsung-exynos.rc':
+        'service vendor.livedisplay-hal-samsung-exynos (needs /sys/class/mdnie/mdnie/*; no mdnie driver on 6.12)',
 }
 # v6: HALs whose services are disabled above are also removed from the device
 # VINTF manifest, so nothing blocks in getService()/waitForDeclaredService().
 VINTF_DROP = {
     '/vendor/etc/vintf/manifest.xml': ['android.hardware.drm', 'android.hardware.gatekeeper',
-                                       'vendor.samsung.hardware.security.widevine.keyprovisioning'],
+                                       'vendor.samsung.hardware.security.widevine.keyprovisioning',
+                                       # v11: hardware absent, see EMPTY
+                                       'vendor.lineage.touch', 'vendor.lineage.livedisplay'],
     '/vendor/etc/vintf/manifest/android.hardware.biometrics.fingerprint-service.samsung.xml':
         ['android.hardware.biometrics.fingerprint'],
+}
+# v11: system features whose framework service would wait forever for a HAL
+# that cannot exist in this boot. android.hardware.fingerprint makes SystemServer
+# start FingerprintService; with no real IFingerprint declared (its HAL is a TEE
+# client, disabled since v6) it falls back to the "virtual" instance and waits
+# for IVirtualHal/virtual, which this build does not ship. Removing the feature
+# is what a device without a usable fingerprint sensor declares.
+FEATURE_DROP = {
+    '/vendor/etc/permissions/android.hardware.fingerprint.xml': ['android.hardware.fingerprint'],
 }
 # v6: init.rc execs that would block boot on a TEE-backed HAL run in the background.
 BACKGROUND_EXECS = {('/system/bin/vdc', 'keymaster', 'earlyBootEnded')}
@@ -79,6 +99,22 @@ CMDLINE_EXTRA = ('androidboot.hardware=samsungexynos9810 androidboot.selinux=per
 
 sha = lambda b: hashlib.sha256(b).hexdigest()
 report = []
+
+
+def feature_drop(cpath, text):
+    # Remove <feature name="X" .../> lines from a permissions file; each exactly once.
+    new = text
+    for name in FEATURE_DROP[cpath]:
+        pat = re.compile(r'[ \t]*<feature\s+name="' + re.escape(name) + r'"\s*/>[ \t]*\n')
+        if len(pat.findall(new)) != 1:
+            raise SystemExit(f'FEATURE drop {cpath} {name}: not exactly one match')
+        new = pat.sub('', new)
+        report.append(f'{cpath}: FEATURE drop {name}')
+    import xml.dom.minidom
+    xml.dom.minidom.parseString(new.encode())
+    if '<permissions>' not in new:
+        raise SystemExit('FEATURE result lost the permissions element ' + cpath)
+    return new
 
 
 def vintf_drop(cpath, text):
@@ -179,11 +215,14 @@ def main():
             report.append(f'{cpath}: EMPTY overlay: {EMPTY[cpath]}')
             if cpath.endswith('.rc'):
                 sanitize(cpath, data.decode('utf-8', 'replace'))
-        elif cpath in VINTF_DROP:
-            new = vintf_drop(cpath, data.decode('utf-8'))
+        elif cpath in VINTF_DROP or cpath in FEATURE_DROP:
+            if cpath in VINTF_DROP:
+                new = vintf_drop(cpath, data.decode('utf-8'))
+            else:
+                new = feature_drop(cpath, data.decode('utf-8'))
             # romram.h reads replacement names with %63s: keep them short
-            rname = 'vintf_' + sha(cpath.encode())[:16] + '.xml'
-            report.append(f'{cpath}: VINTF replacement sanitized/{rname}')
+            rname = ('vintf_' if cpath in VINTF_DROP else 'feature_') + sha(cpath.encode())[:16] + '.xml'
+            report.append(f'{cpath}: replacement sanitized/{rname}')
             (pay / 'sanitized' / rname).write_text(new)
             repls[rname] = new.encode()
             action = 'replace:' + rname
@@ -227,6 +266,9 @@ def main():
         assert c in seen, 'EMPTY target not found ' + c
     for c in VINTF_DROP:
         assert c in seen, 'VINTF target not found ' + c
+    for c in FEATURE_DROP:
+        assert c in seen, 'FEATURE target not found ' + c
+    assert not set(VINTF_DROP) & set(FEATURE_DROP)
     assert any('exec -> exec_background' in r and 'earlyBootEnded' in r for r in report), \
         'vdc keymaster earlyBootEnded not found'
     # build type must allow androidboot.selinux=permissive
