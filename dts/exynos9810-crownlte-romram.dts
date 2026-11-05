@@ -85,3 +85,17 @@
 &sysmmu_dpu1 { status = "disabled"; };
 &sysmmu_dpu2 { status = "disabled"; };
 &decon_handover { status = "disabled"; };
+
+/*
+ * decon-pool 48 -> 192 MiB (also set in the kernel combined DTS since
+ * crownlte-display-flipfix; repeated here so this DTB does not depend on
+ * it). v14: with ro.vendor.ddk.set.afbc=0 the keyguard frames carry four
+ * scattered layers (17.3 + 17.0 + 0.7 + 0.7 MB), each copied into a pair of
+ * per-window decon-pool slots while the frame on screen keeps its own, and
+ * from 39.3 s every frame failed with "cannot allocate ... from decon-pool".
+ * Reusable CMA below 4 GiB, in the free spans 0xcd400000-0xe18fffff /
+ * 0xe3700000-0xefffffff of the v14 reserved-memory map.
+ */
+&decon_pool {
+	size = <0x0c000000>;
+};
