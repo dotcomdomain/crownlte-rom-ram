@@ -357,3 +357,94 @@ Unchanged, with the new times:
 - The 30 s watchdog and `panic=30` cover kernel hangs. Otherwise hold Power + Volume Down; use Odin with
   bright-recovery.tar if it loops into RECOVERY.
 - Afterwards restore bright RECOVERY (8763860c) and wait for boot=booted.
+
+---
+
+# v7: 32-bit time syscalls, thermal-isp-0 stub, /dev/input (2026-11-04)
+
+Builds on v6 (recovery db96d05d, ran 2026-11-04 21:11-21:23). The earlier sections still apply. This section
+covers only the differences.
+
+Image: gekko `rom-ram/pack-romram-20261104g/recovery.img`
+sha256 `22aef45a620679f5ec6df2c910622721f8d4c5df648974cc405ceab31aa2e197` (68,149,248 bytes).
+Windows: `C:\Users\Patrick\tools\trial-romram-20261104\v7\recovery.img` (+ manifest.json, hash verified).
+
+| input | sha256 |
+|---|---|
+| kernel Image: crownlte-display-flipfix 8dc0a362b, v6 config + COMPAT_32BIT_TIME=y, build/romram-6.12.93 (snapshot v7/) | 05b3d3f38235d9ddf977a5c6fed8c0ec90cfc73fa44355334637aee946552f82 |
+| .config | 5d0e8bc9b0fa8bb254d5b174d2d30179323ec6582f771646d8ad585c19954884 |
+| DTB exynos9810-crownlte-romram.dtb (src a38f49e) | a6a888a8b7c92b1242949e43a74791c6ff492407595dd65fcfa3698e223f3ac4 |
+| ramdisk rom-ram/build-5/diagnostic-initramfs.cpio.gz (src a38f49e) | 623bb9dbe480f6ac818c49562790eff55c4fafa16128ebd3cbb00760fc697b9b |
+| payload manifest (unchanged since v6) | d727af14e82eb8644ba653ab753edb18755b55ce4d56ffc6b01e0e345cf22c9a |
+| shim bbea959 (loader) | c74f6841352ce15b70472b0a827835841f408afe7ba33ff5276ce9f12a07d15f |
+
+The display agent's WIN_CONFIG fix is **not** included. HWC frames will still be rejected (`win0 rejected (state 2
+fmt 6 idma 4 ...): -22`).
+
+## v6 findings and v7 fixes
+1. **32-bit zygote crash loop (the main blocker). Kernel config, not a CPU or JIT problem.**
+   - `CONFIG_COMPAT_32BIT_TIME` was off (crownlte defconfig since 4c9c96c18), so 32-bit tasks got ENOSYS for
+     futex, clock_gettime past the vDSO, nanosleep, ppoll, pselect6, utimensat, timerfd_* and others.
+   - zygote_secondary's ART logged `futex wait failed ...: Function not implemented` (117,912 lines, most of the
+     180 MB log) and `Failed to get thread cpu time: Function not implemented`, then aborted.
+   - Its abort path also uses futex, so it recursed until the "Jit thread pool" stack hit its guard page:
+     `SEGV_ACCERR` at `0xda3d0ff8`, a 32-bit address ending in `ff8`. That is the 8 SIGSEGV + 54 SIGABRT
+     zygote_secondary deaths.
+   - Each death restarted zygote (64-bit) via onrestart, and with it audioserver, cameraserver, media, netd,
+     wificond and vendor.audio-hal (~60 cycles each).
+   - system_server (pid 361) never ran SystemServer: it sat in `waitForSecondaryZygote` ("Got error connecting
+     to zygote" every 50 ms) until the cascade SIGKILLed it. `sys.system_server.start_count` was never set and
+     `sys.boot_completed` was **not** reached.
+   - Fix: f950da396 drops the `# CONFIG_COMPAT_32BIT_TIME is not set` line (default y with COMPAT, as in GKI).
+     `__arm64_sys_futex_time32`, `clock_gettime32`, `nanosleep_time32` and `ppoll_time32` are now present in
+     System.map. Config delta vs v6: exactly `COMPAT_32BIT_TIME n -> y`.
+   - Ruled out: the M3/A55 CPU-feature mismatch, JIT memfd dual-mapping, userfaultfd, MTE/PAC and the compat vDSO.
+     Every failing call is a time32 syscall that returned ENOSYS.
+2. **Vibrator HAL** (`android.hardware.vibrator-service.samsung`, 63 SIGABRT): its `Vibrator()` constructor runs
+   `std::filesystem::directory_iterator("/dev/input")`. There is no input device (no gpio-keys/touch), so ueventd
+   never created the directory. Fix: init.diag.rc creates an empty `/dev/input` at early-init.
+   gpio-keys for vol up/down, Bixby and power (4.9: alive-bank EINT pins) is left for a hardware-tested step.
+3. **Thermal HAL** (`android.hardware.thermal-service.pixel`, 60 SIGABRT): `Could not find thermal-isp-0 in CDEV
+   sysfs` -> `Failed to initialize throttling map` -> abort. thermal_info_config.json wants:
+   - sensors BIG, LITTLE, G3D, ISP, ac, battery: all present (TMU zones; `ac`/`battery` from max77705-ro-battery);
+   - cdevs thermal-cpufreq-0/1, thermal-gpufreq-0: present;
+   - cdev **thermal-isp-0: missing**.
+   Fix: 8dc0a362b adds an opt-in stub cooling device to the ACPM TMU driver. It has a single state 0, refuses any
+   other state, touches no hardware and is not bound to any zone. The ROM-RAM DTB sets
+   `samsung,stub-cooling-device = "thermal-isp-0"` on tmu-isp. The base diagnostic DTBs are unchanged
+   (combined 4530f0c5).
+4. Not addressed, not boot-blocking:
+   - vendor.camera.provider (32-bit): SIGSEGV after "static information is NULL" (no camera sensors);
+   - RIL/cpboot (no modem), wificond (no wifi), audio HAL routes;
+   - HWC WIN_CONFIG rejects (display agent).
+
+## How to run
+Same as v6 (600 s deadline):
+```
+powershell -ExecutionPolicy Bypass -File C:\Users\Patrick\tools\trial-romram-20261104\romram-capture.ps1 -Seconds 630 -Out C:\Users\Patrick\tools\trial-romram-20261104\v7\serial-romram-v7.bin
+```
+
+## Expected milestones
+- Kernel: `exynos9810-tmu 10074000.tmu-isp: stub cooling device thermal-isp-0 = cooling_deviceN, max_state 0`.
+  N is probably 1: the TMU sensors probe (~0.32 s) before cpufreq (~0.44 s), so the cpufreq devices move to 2/3.
+  This is harmless; thermal_symlinks and the HAL go by name.
+- Everything that passed in v6 again: colours kept, brightness PASS, 146 files verified, software keymaster,
+  keystore2, HWC3, surfaceflinger, bootanim.
+- New markers: `zygote_secondary (32-bit) running` (and it stays running), `thermal HAL running`,
+  `vibrator HAL running`, `system_server started`.
+- Absent: `futex wait failed`, `Function not implemented` from zygote, `ThermalHAL could not be initialized`,
+  `directory_iterator ... /dev/input`, the zygote/audioserver/netd restart cascade.
+- system_server boot phases in `L;` (`SystemServerTiming`, `ActivityManager: System now ready`), then
+  `sys.boot_completed=1` (marker `crownlte-romram: sys.boot_completed=1`).
+- The panel shows the SBoot logo in correct colours. bootanim is running, but its frames are rejected until the
+  WIN_CONFIG fix lands.
+
+Likely next blockers:
+- system_server services whose HALs are missing or crashing (camera provider, audio, sensors, wifi);
+- LockSettings with no gatekeeper (fails fast now);
+- odsign/odrefresh (bypassed after 60 s);
+- the `updatable_crashing` path if an updatable service keeps exiting.
+
+## Abort / return path
+Unchanged from v6: container SIGKILL at 575 s, restart at 600 s, watchdog/panic fallbacks, then restore bright
+RECOVERY (8763860c).
