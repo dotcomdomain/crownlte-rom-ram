@@ -85,6 +85,22 @@ VINTF_DROP = {
 FEATURE_DROP = {
     '/vendor/etc/permissions/android.hardware.fingerprint.xml': ['android.hardware.fingerprint'],
 }
+# v14: read-only property overrides, applied by replacing the verified prop
+# file in the container. Each key must be defined exactly once in that file,
+# with the expected old value, and in no other prop file init loads. The
+# replacement differs from the original in exactly those lines.
+#  - ro.vendor.ddk.set.afbc 1 -> 0: libexynosdisplay (HWC client target) and
+#    gralloc.universal9810 allocate AFBC-compressed buffers when it is 1. The
+#    6.12 DPU path shows a black panel with the AFBC client target while the
+#    q48 kernel display matrix reaches the panel on every window/channel, so
+#    v14 tests the linear (uncompressed) client target.
+PROP_SET = {
+    '/vendor/build.prop': [('ro.vendor.ddk.set.afbc', '1', '0')],
+}
+# Other prop files init loads (must not define a PROP_SET key).
+PROP_FILES = ['/system/build.prop', '/system/system_ext/etc/build.prop',
+              '/system/product/etc/build.prop', '/system/etc/prop.default', '/vendor/default.prop',
+              '/vendor/build.prop', '/odm/etc/build.prop', '/vendor/odm/etc/build.prop']
 # v6: init.rc execs that would block boot on a TEE-backed HAL run in the background.
 BACKGROUND_EXECS = {('/system/bin/vdc', 'keymaster', 'earlyBootEnded')}
 DISARM_CMDS = {'mount_all', 'swapon_all', 'umount_all', 'remount_userdata'}
@@ -99,6 +115,26 @@ CMDLINE_EXTRA = ('androidboot.hardware=samsungexynos9810 androidboot.selinux=per
 
 sha = lambda b: hashlib.sha256(b).hexdigest()
 report = []
+
+
+def prop_set(cpath, text):
+    # Change 'key=old' to 'key=new'; the key must appear exactly once in cpath.
+    lines = text.splitlines(keepends=True)
+    out = list(lines)
+    for key, old, new in PROP_SET[cpath]:
+        hits = [i for i, l in enumerate(lines)
+                if l.split('#', 1)[0].strip().split('=', 1)[0].strip() == key]
+        if len(hits) != 1:
+            raise SystemExit(f'PROP {cpath} {key}: {len(hits)} definitions')
+        i = hits[0]
+        if lines[i].rstrip('\r\n') != f'{key}={old}':
+            raise SystemExit(f'PROP {cpath} {key}: line is {lines[i]!r}, expected {key}={old}')
+        out[i] = f'{key}={new}\n'
+        report.append(f'{cpath}:{i + 1}: PROP {key}={old} -> {key}={new}')
+    changed = [i for i in range(len(lines)) if lines[i] != out[i]]
+    if len(changed) != len(PROP_SET[cpath]) or len(out) != len(lines):
+        raise SystemExit(f'PROP {cpath}: unexpected change set {changed}')
+    return ''.join(out)
 
 
 def feature_drop(cpath, text):
@@ -215,13 +251,18 @@ def main():
             report.append(f'{cpath}: EMPTY overlay: {EMPTY[cpath]}')
             if cpath.endswith('.rc'):
                 sanitize(cpath, data.decode('utf-8', 'replace'))
-        elif cpath in VINTF_DROP or cpath in FEATURE_DROP:
+        elif cpath in VINTF_DROP or cpath in FEATURE_DROP or cpath in PROP_SET:
             if cpath in VINTF_DROP:
                 new = vintf_drop(cpath, data.decode('utf-8'))
-            else:
+                kind, ext = 'vintf_', '.xml'
+            elif cpath in FEATURE_DROP:
                 new = feature_drop(cpath, data.decode('utf-8'))
+                kind, ext = 'feature_', '.xml'
+            else:
+                new = prop_set(cpath, data.decode('utf-8'))
+                kind, ext = 'prop_', '.prop'
             # romram.h reads replacement names with %63s: keep them short
-            rname = ('vintf_' if cpath in VINTF_DROP else 'feature_') + sha(cpath.encode())[:16] + '.xml'
+            rname = kind + sha(cpath.encode())[:16] + ext
             report.append(f'{cpath}: replacement sanitized/{rname}')
             (pay / 'sanitized' / rname).write_text(new)
             repls[rname] = new.encode()
@@ -269,6 +310,16 @@ def main():
     for c in FEATURE_DROP:
         assert c in seen, 'FEATURE target not found ' + c
     assert not set(VINTF_DROP) & set(FEATURE_DROP)
+    assert not set(PROP_SET) & (set(VINTF_DROP) | set(FEATURE_DROP))
+    for c in PROP_SET:
+        assert c in seen, 'PROP target not found ' + c
+    keys = {k for v in PROP_SET.values() for k, _, _ in v}
+    for f in PROP_FILES:
+        if f in PROP_SET or not os.path.lexists(host(f)):
+            continue
+        for l in host(f).read_text(errors='replace').splitlines():
+            k = l.split('#', 1)[0].strip().split('=', 1)[0].strip()
+            assert k not in keys, f'PROP key {k} also defined in {f}'
     assert any('exec -> exec_background' in r and 'earlyBootEnded' in r for r in report), \
         'vdc keymaster earlyBootEnded not found'
     # build type must allow androidboot.selinux=permissive

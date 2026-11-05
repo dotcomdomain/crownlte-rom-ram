@@ -98,3 +98,7 @@ on property:init.svc.vendor.thermal-hal=running
 
 on property:init.svc.vendor.vibrator-default=running
     write /dev/kmsg "<6>crownlte-romram: vibrator HAL running"
+
+# v14: the HWC/gralloc AFBC switch as init loaded it (expected 0)
+on property:ro.vendor.ddk.set.afbc=*
+    write /dev/kmsg "<6>crownlte-romram: ro.vendor.ddk.set.afbc=${ro.vendor.ddk.set.afbc}"
