@@ -16,6 +16,10 @@ while true; do
   getprop | grep -E '^\[(init\.svc\.|apexd\.|keystore\.|odsign\.|ro\.crypto\.|sys\.boot|dev\.bootcomplete|vold\.|ro\.boot\.(hardware|mode|selinux|init_rc)|ro\.hardware|sys\.init\.|ro\.boottime\.init|persist\.sys\.boot\.reason|service\.bootanim\.|sys\.system_server\.|sys\.usb\.|ro\.kernel\.version|ro\.build\.type)'
   echo "--- getenforce=$(cat /sys/fs/selinux/enforce 2>&1) loadavg=$(cat /proc/loadavg)"
   grep -E '^(MemTotal|MemFree|MemAvailable|Shmem|SwapTotal|SwapFree):' /proc/meminfo
+  if [ $n -eq 0 ]; then
+    echo "--- frp ro.frp.pst=$(getprop ro.frp.pst)"
+    ls -lL /dev/block/persistent 2>&1; ls -l /dev/block/persistent /dev/block/platform/11120000.ufs/by-name 2>&1
+  fi
   if [ $((n % 3)) -eq 0 ]; then
     echo "--- ps"
     ps -A -o PID,PPID,S,WCHAN,TIME,NAME 2>&1

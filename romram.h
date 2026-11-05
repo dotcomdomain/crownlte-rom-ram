@@ -356,6 +356,7 @@ static int rr_verify(struct rr_manifest *m, const char *root, const char *repl_d
 #define RR_UFS "/sys/bus/platform/devices/11120000.ufs"
 #define RR_GUARD RR_UFS "/of_node/crownlte,read-only-diagnostic"
 #define AID_READPROC 3009
+#define AID_SYSTEM 1000
 
 static int rr_kmsg = -1;
 static void rr_log(const char *fmt, ...)
@@ -531,6 +532,200 @@ static int rr_mount(const char *src, const char *dst, const char *type,
 static struct rr_manifest rr_m;
 static struct rr_blk rr_blocks[256];
 
+/* ------------------------------------------------------------------- FRP */
+/*
+ * v10: PersistentDataBlockService opens ro.frp.pst (/dev/block/persistent,
+ * which init.samsungexynos9810.rc links to by-name/PERSISTENT). The container
+ * hides the UFS from ueventd, so no by-name links exist and system_server
+ * died in boot phase 500. FRP must not be bypassed and PERSISTENT must never
+ * be written, so the service gets the device's REAL FRP block as a RAM copy:
+ *  - the real partition is read through its block node, opened O_RDONLY
+ *    after BLKROSET=1 was verified on it (the SCSI write guard also
+ *    rejects any write to the UFS);
+ *  - the bytes go into a private tmpfs outside RR_ROOT, unreachable once
+ *    the container chroots (only the loop device keeps the file open);
+ *  - read 1 (hash of the partition), read 2 (the copy, re-hashed) and
+ *    read 3 (through the loop device) must give the same sha256;
+ *  - the loop device is read-write, so whatever the service writes
+ *    (format, OEM-unlock bit, ...) lands in RAM and is gone at restart;
+ *  - only by-name/PERSISTENT is created in the container. RADIO, MISC,
+ *    STEADY, PARAM and every other partition stay invisible.
+ * Any failure leaves the node absent (the v9 behaviour), never a fake one.
+ */
+#include <linux/loop.h>
+
+#define RR_FRP_PART "PERSISTENT"
+#define RR_FRP_DIR "/crownlte-frp"
+#define RR_FRP_IMG RR_FRP_DIR "/persistent.img"
+#define RR_FRP_MAX (4ULL << 20)
+#define RR_FRP_BYNAME RR_ROOT "/dev/block/platform/11120000.ufs/by-name"
+
+static int rr_sha_at0(int fd, char hex[65], unsigned long long *size)
+{
+        if (lseek(fd, 0, SEEK_SET) < 0)
+                return -errno;
+        return rr_sha_fd(fd, hex, size);
+}
+
+static int rr_copy_fd(int in, int out, unsigned long long bytes)
+{
+        static char buf[65536];
+        unsigned long long done = 0;
+        while (done < bytes) {
+                size_t want = bytes - done < sizeof(buf) ? (size_t)(bytes - done) : sizeof(buf);
+                ssize_t n = pread(in, buf, want, (off_t)done);
+                if (n < 0 && errno == EINTR)
+                        continue;
+                if (n < 0)
+                        return -errno;
+                if (n == 0)
+                        return -EIO;
+                for (ssize_t w = 0; w < n;) {
+                        ssize_t m = pwrite(out, buf + w, (size_t)(n - w), (off_t)(done + (unsigned long long)w));
+                        if (m < 0 && errno == EINTR)
+                                continue;
+                        if (m < 0)
+                                return -errno;
+                        w += m;
+                }
+                done += (unsigned long long)n;
+        }
+        return 0;
+}
+
+static int rr_mkdirs(const char *path, mode_t mode)
+{
+        char tmp[RR_PATH];
+        if ((size_t)snprintf(tmp, sizeof(tmp), "%s", path) >= sizeof(tmp))
+                return -ENAMETOOLONG;
+        for (char *c = tmp + 1; *c; c++) {
+                if (*c != '/')
+                        continue;
+                *c = 0;
+                if (mkdir(tmp, mode) && errno != EEXIST)
+                        return -errno;
+                *c = '/';
+        }
+        if (mkdir(tmp, mode) && errno != EEXIST)
+                return -errno;
+        return 0;
+}
+
+static int rr_frp_setup(int nblk)
+{
+        const struct rr_blk *x = NULL;
+        const char *what = "find";
+        char node[64], loopdev[32], dst[RR_PATH];
+        char src_sha[65] = "", img_sha[65] = "", loop_sha[65] = "";
+        unsigned long long bytes = 0, n1 = 0, n2 = 0, n3 = 0, lbytes = 0;
+        unsigned char hdr[40], last = 0;
+        struct stat st;
+        int blk = -1, img = -1, ctl = -1, lfd = -1, ro = 0, num = -1, matches = 0, error = 0;
+
+        for (int i = 0; i < nblk; i++)
+                if (rr_blocks[i].partition && !strcmp(rr_blocks[i].partname, RR_FRP_PART)) {
+                        x = &rr_blocks[i];
+                        matches++;
+                }
+        if (matches != 1) {
+                error = matches ? -EEXIST : -ENOENT;
+                goto out;
+        }
+
+        /* read 1: the real partition, read-only, hashed */
+        what = "open-partition";
+        snprintf(node, sizeof(node), "/dev/%s", x->name);
+        blk = open(node, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (blk < 0) { error = -errno; goto out; }
+        what = "check-partition";
+        if (fstat(blk, &st)) { error = -errno; goto out; }
+        if (!S_ISBLK(st.st_mode) || st.st_rdev != makedev(x->major, x->minor)) { error = -EXDEV; goto out; }
+        if (ioctl(blk, BLKROGET, &ro)) { error = -errno; goto out; }
+        if (ro != 1) { error = -EROFS; goto out; }
+        if (ioctl(blk, BLKGETSIZE64, &bytes)) { error = -errno; goto out; }
+        if (bytes < 4096 || bytes > RR_FRP_MAX || bytes % 512) { error = -EFBIG; goto out; }
+        what = "hash-partition";
+        if ((error = rr_sha_at0(blk, src_sha, &n1))) goto out;
+        if (n1 != bytes) { error = -EIO; goto out; }
+
+        /* read 2: copy into a private tmpfs that the container never sees */
+        what = "ram-tmpfs";
+        if (mkdir(RR_FRP_DIR, 0700) && errno != EEXIST) { error = -errno; goto out; }
+        if ((error = rr_mount("tmpfs", RR_FRP_DIR, "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                              "mode=0700,size=8m")))
+                goto out;
+        what = "ram-copy";
+        img = open(RR_FRP_IMG, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (img < 0) { error = -errno; goto out; }
+        if ((error = rr_copy_fd(blk, img, bytes))) goto out;
+        close(blk);
+        blk = -1;
+        what = "verify-copy";
+        if ((error = rr_sha_at0(img, img_sha, &n2))) goto out;
+        if (n2 != bytes || strcmp(src_sha, img_sha)) { error = -EBADMSG; goto out; }
+        if (pread(img, hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr) ||
+            pread(img, &last, 1, (off_t)(bytes - 1)) != 1) { error = -EIO; goto out; }
+
+        /* loop device on the RAM copy, read-write: writes stay in RAM */
+        what = "loop";
+        ctl = open("/dev/loop-control", O_RDWR | O_CLOEXEC);
+        if (ctl < 0) { error = -errno; goto out; }
+        for (int attempt = 0; attempt < 8 && lfd < 0; attempt++) {
+                struct loop_config cfg;
+                num = ioctl(ctl, LOOP_CTL_GET_FREE);
+                if (num < 0) { error = -errno; goto out; }
+                snprintf(loopdev, sizeof(loopdev), "/dev/loop%d", num);
+                for (int w = 0; w < 100 && access(loopdev, F_OK); w++)
+                        usleep(10000);
+                lfd = open(loopdev, O_RDWR | O_CLOEXEC);
+                if (lfd < 0) { error = -errno; goto out; }
+                memset(&cfg, 0, sizeof(cfg));
+                cfg.fd = (__u32)img;
+                snprintf((char *)cfg.info.lo_file_name, LO_NAME_SIZE, "crownlte-frp-ram-copy");
+                if (!ioctl(lfd, LOOP_CONFIGURE, &cfg))
+                        break;
+                error = -errno;
+                close(lfd);
+                lfd = -1;
+                if (error != -EBUSY)
+                        goto out;
+        }
+        if (lfd < 0) goto out;
+        error = 0;
+
+        /* read 3: through the loop device */
+        what = "verify-loop";
+        if (ioctl(lfd, BLKGETSIZE64, &lbytes)) { error = -errno; goto out; }
+        if (lbytes != bytes) { error = -EXDEV; goto out; }
+        if ((error = rr_sha_at0(lfd, loop_sha, &n3))) goto out;
+        if (n3 != bytes || strcmp(src_sha, loop_sha)) { error = -EBADMSG; goto out; }
+        if (fstat(lfd, &st)) { error = -errno; goto out; }
+
+        /* the node init's "symlink .../by-name/PERSISTENT /dev/block/persistent" targets */
+        what = "container-node";
+        if ((error = rr_mkdirs(RR_FRP_BYNAME, 0755))) goto out;
+        snprintf(dst, sizeof(dst), "%s/%s", RR_FRP_BYNAME, RR_FRP_PART);
+        if (mknod(dst, S_IFBLK | 0660, st.st_rdev)) { error = -errno; goto out; }
+        if (chown(dst, AID_SYSTEM, AID_SYSTEM) || chmod(dst, 0660)) { error = -errno; goto out; }
+
+        rr_log("FRP: real %s (%s, %llu bytes) sha256=%s read read-only (BLKRO=1), copied to a private RAM tmpfs and verified 3x",
+               RR_FRP_PART, x->name, bytes, src_sha);
+        rr_log("FRP: RAM copy attached read-write as loop%d (%u:%u, file name crownlte-frp-ram-copy); writes stay in RAM; container /dev/block/platform/11120000.ufs/by-name/%s -> loop%d (0660 system:system)",
+               num, major(st.st_rdev), minor(st.st_rdev), RR_FRP_PART, num);
+        rr_log("FRP: PDB header magic=%02x%02x%02x%02x data_len=%u oem_unlock_byte=%u (informational; nothing is changed)",
+               hdr[32], hdr[33], hdr[34], hdr[35],
+               (unsigned)hdr[36] << 24 | (unsigned)hdr[37] << 16 | (unsigned)hdr[38] << 8 | hdr[39], last);
+out:
+        if (blk >= 0) close(blk);
+        if (img >= 0) close(img);
+        if (lfd >= 0) close(lfd);
+        if (ctl >= 0) close(ctl);
+        if (error)
+                rr_log("FRP: /dev/block/persistent NOT provided: step %s errno=%d (%d %s partitions; src=%s copy=%s loop=%s); PersistentDataBlockService will fail as in v9",
+                       what, -error, matches, RR_FRP_PART, src_sha, img_sha, loop_sha);
+        return error;
+}
+
 static int romram_child(void *unused)
 {
         char path[RR_PATH * 2], real[PATH_MAX], cmdline[4096], extra[2048];
@@ -705,6 +900,8 @@ static int romram_child(void *unused)
                         RR_DO("dev-shadow", rr_write(path, "", 0, 0400));
                 }
         }
+        /* 5a-frp. Real FRP block as a verified RAM copy (non-fatal, see rr_frp_setup). */
+        (void)rr_frp_setup(nblk);
         RR_DO("payload-rc", rr_copy(RR_PAYLOAD "/init.diag.rc", RR_ROOT "/dev/crownlte/init.diag.rc", 0644));
         RR_DO("payload-probe", rr_copy(RR_PAYLOAD "/probe.sh", RR_ROOT "/dev/crownlte/probe.sh", 0755));
         RR_DO("payload-user0", rr_copy(RR_PAYLOAD "/init_user0.sh", RR_ROOT "/dev/crownlte/init_user0.sh", 0755));
