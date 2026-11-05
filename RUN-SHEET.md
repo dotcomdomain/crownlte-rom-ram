@@ -234,3 +234,126 @@ The panel flicker stopping at about 1 s is a pass on its own (owner-visible).
   wait for boot=booted (~8 min) before the next reboot.
 - Never run this with a TEE-enabled DTB. The ROM stage refuses it anyway (`Trustonic TEE present` /
   `DT /tee status=okay`).
+
+---
+
+# v6: keymaster without the TEE, TEE clients off, fb0 colours fixed (2026-11-04)
+
+Builds on v5 (`pack-romram-20261104e`, recovery c8cf058d: UFS LRB fix 900d76030). The v3/v4 sections above still
+apply. This section covers only the differences.
+
+Image: gekko `rom-ram/pack-romram-20261104f/recovery.img`
+sha256 `db96d05d8fa314d4ec0c7da9acd2c15c5a230a6c2f33a91421df02a4ded942c3` (68,149,248 bytes).
+Windows: `C:\Users\Patrick\tools\trial-romram-20261104\v6\recovery.img` (+ manifest.json, hash verified).
+
+| input | sha256 |
+|---|---|
+| kernel Image: crownlte-display-flipfix 550660610 (900d76030 + fb0 format fix), config = v4 (VT=n), build/romram-6.12.93 (snapshot v6/) | 1d98cee711f8f2acc0fddb629aa882ca01d0fa269636dfbcfa1a8164c3b0a654 |
+| .config (unchanged since v4) | 69518817c3e0abac54223269d59d01366e2a4f5d5fecf2481b6cb8ed4f1dec39 |
+| DTB exynos9810-crownlte-romram.dtb (unchanged since v4) | 8c5ec543fd753e7addc3bc37777765a5628a8dc109e7f1c99882507a234bc18a |
+| ramdisk rom-ram/build-4/diagnostic-initramfs.cpio.gz (src 34fcf4c) | 2a4263f0c67e720f5b194c808fdb9d029bcece72a5b080682db9d3bb450051ac |
+| payload manifest (152 entries, 146 files hashed) | d727af14e82eb8644ba653ab753edb18755b55ce4d56ffc6b01e0e345cf22c9a |
+| shim bbea959 (loader) | 19865d47b276c07bd176c2a0002196cdb04f1783c721b58b2f0c7533a24b9c11 |
+| restore image (bright RECOVERY) | 8763860c11a272cb6c341f2fc561e38adb5ea621a16ef7a5b083d9b6d28a8a0e |
+
+## What changed vs v5
+- **Keymaster without the TEE.** The v5 block was keystore2 (`critical`), which builds its mandatory TEE security
+  level through km_compat. km_compat blocked in HIDL `getService()` for the declared keymaster@3.0, whose MDFPP
+  module could not open the TEE. `android.security.maintenance` never registered, so vold's earlyBootEnded never
+  returned.
+  v6 masks `/vendor/lib64/hw/keystore.mdfpp.so` (the module selected by `ro.hardware.keystore=mdfpp`; it loads
+  libkeymaster2_mdfpp -> libkeymaster_helper_vendor -> libMcClient). `hw_get_module_by_class("keystore")` then
+  fails, and the stock keymaster@3.0-impl uses its built-in SoftKeymasterDevice. km_compat (system) uses that
+  insecure HAL as the TEE device. This is the stock software path; both log strings are in the shipped binaries.
+  The vendor.keymaster-3-0 service therefore still runs, but as pure software. Keys exist only in keystore2's
+  database on the tmpfs /data.
+- **TEE clients disabled** with EMPTY rc overlays: `mobicore` (mcDriverDaemon), `vendor.gatekeeper-1-0`,
+  `vendor.drm-widevine-hal-1-2`, `vendor.wvkprov_server_hal` and `vendor.fingerprint-default`. `libMcClient.so`
+  (lib64 + lib) is EMPTY as well, so any client that is still left fails to load instead of calling the TEE. No
+  enabled service links it.
+- **VINTF:** the drm/widevine, gatekeeper and widevine-keyprovisioning HALs are removed from
+  `/vendor/etc/vintf/manifest.xml`, and the fingerprint HAL from its fragment, so gatekeeperd and system_server do
+  not wait for them. keymaster@3.0 stays declared.
+- **init.rc:** `exec vdc keymaster earlyBootEnded` -> `exec_background`, so a slow HAL can never block boot again.
+- **Deadline 600 s** (was 300). The container is killed at 575 s.
+- New kmsg markers for keymaster, keystore2, module hash, HWC3, surfaceflinger, bootanim and system_server. Probe
+  lines also show `service.bootanim.*` and `sys.system_server.*`.
+- **Kernel, fb0 colours (550660610):**
+  - Cause: SBoot scans the boot buffer with IDMA format 0 (ARGB8888, bytes A,R,G,B). The takeover committed the
+    4.9 default DPP BGRA_8888, which produced the blue background and pink logo.
+  - Fix: adopt now records the SBoot format, and the takeover (and the self-test restore) keep it. fb0 reports the
+    matching fb_bitfield layout. The buffer is not rewritten, so the panel should not change at the takeover.
+  - The A/B self-test buffers keep BGRA_8888.
+
+## Why it is safe
+- `init.c` and `romram.h` are byte-identical to v4/v5. The SCSI write guard check, BLKROSET on every sd* node, the
+  TEE refusal (`/dev/mobicore*`, mcd binding, DT /tee) and the read-only mounts are unchanged.
+- The overlays still disarm mount_all/swapon_all; uncrypt, misctrl and vendor_flash_recovery stay EMPTY.
+  init_user0 is still bounded, and nothing writes misc/BCB or any partition. The generator still refuses unhandled
+  storage-mutating rc lines.
+- Every file the overlays replace or mask is sha256-verified before init runs (146 files). A changed vendor or
+  system image means `verify MISMATCH` and no Lineage start.
+- v6 only removes TEE contact. The TEE is absent anyway (DT /tee disabled; the ROM stage refuses otherwise). Now no
+  TEE daemon starts, no TA client library can load, and keymaster never tries the secure world. The software
+  keymaster writes nothing outside the tmpfs /data, so there is no key upgrade or rewrap that 4.9 could see.
+
+## How to run
+Same frames as before. Capture longer:
+```
+powershell -ExecutionPolicy Bypass -File C:\Users\Patrick\tools\trial-romram-20261104\romram-capture.ps1 -Seconds 630 -Out C:\Users\Patrick\tools\trial-romram-20261104\v6\serial-romram-v6.bin
+```
+The run takes about 10.5 min, followed by the normal Lineage boot. Watch the screen.
+
+## Expected milestones
+Kernel:
+- `adopted: win.. dpp.. IDMA format 0 at 0xcc000000; fb0 keeps it (DPP format 0)`.
+- `fb0 takeover: ... DPP format 0 (SBoot IDMA format 0 kept) ...: 0, latched ...`. **On the panel, the SBoot logo
+  keeps its original colours.** No blue background or pink logo.
+- `panel-bright: RESULT PASS` at about 1 s (flicker stops). UFS as in v5: sda + sdb..sde.
+
+PID1 / ROM stage:
+- `default restart planned after 600s ... container SIGKILL at 575s`.
+- `BLKROSET=1 verified on all 31 sd* nodes`, `Trustonic TEE absent`, `manifest verified: 146 files hashed`.
+- 11 `rc overlay ... -> empty` lines (5 new: fingerprint, widevine, gatekeeper, mobicore, wvkprov; plus
+  keystore.mdfpp.so and both libMcClient.so) and 5 `-> replace` lines (init.rc, init.samsungexynos9810.rc,
+  cppreopts.rc, 2 VINTF files).
+
+Lineage (`crownlte-romram:` kmsg markers and `L;` logcat):
+- `L; ... android.hardware.keymaster@3.0-impl: Could not find any keystore module, using software-only
+  implementation.` and the marker `keymaster@3.0 HAL running (software-only, no TEE module)`.
+- In keystore2: `No secure Keymaster implementation found, but device offers insecure Keymaster HAL. Using as
+  default.`, then `keystore2 running`. The `vdc keymaster earlyBootEnded` background exec exits with status 0.
+- Absent: `TeeMcDaemon`, `starting service 'mobicore'`, `mkdir /efs/TEE`, `keymaster_tee`, `nwd_tz_open`.
+- `keystore.module_hash.sent=true`, or `P;CROWNLTE-BYPASS keystore.module_hash.sent` after 40 s (init waits on it
+  before class main).
+- `zygote-start reached`, `zygote running`, `system_server started`.
+- `HWC3 (vendor.hwcomposer-3) running`, `surfaceflinger running`, `bootanim running`. On the kernel side, fb0 is
+  opened and the WIN_CONFIG commits follow. They are either accepted (boot animation on the panel) or rejected
+  with `buffer not contiguous (segment N); needs the DPU SysMMU` / `win.. rejected`. When rejected, the panel keeps
+  the SBoot logo, now in the right colours.
+- Expected, harmless: gatekeeperd `Could not find Gatekeeper device, which makes me very sad.`
+- Stretch: `sys.boot_completed=1`.
+
+Likely next blockers:
+- keystore2 still refuses the software device. Watch for a keystore2 panic plus a namespace SIGHUP: it is
+  `critical`, so 4 crashes reboot the namespace only.
+- system_server pieces that need gatekeeper/fingerprint (LockSettings, biometrics). The HALs are now undeclared, so
+  these should fail fast instead of hanging.
+- odsign/odrefresh (bypassed after 60 s), netbpfload, and the display buffer path above.
+- No adb (PID1's ACM owns the UDC). Touch is off.
+
+## Success levels
+1. Past `vdc keymaster earlyBootEnded`, with keystore2 running on the software keymaster.
+2. zygote and system_server start.
+3. surfaceflinger + HWC3 running, fb0 WIN_CONFIG attempts logged (accepted or rejected with the reason). Mali in
+   use: `G3D domain on` lines from the runtime power domain.
+4. Boot animation on the panel and/or `sys.boot_completed=1`.
+Panel colours correct after takeover: pass on its own (owner-visible).
+
+## Abort / return path
+Unchanged, with the new times:
+- The container is killed at 575 s, and the timer restarts the phone at 600 s via the watchdog restart guard. The
+  shim then boots normal Lineage (4.9).
+- The 30 s watchdog and `panic=30` cover kernel hangs. Otherwise hold Power + Volume Down; use Odin with
+  bright-recovery.tar if it loops into RECOVERY.
+- Afterwards restore bright RECOVERY (8763860c) and wait for boot=booted.
