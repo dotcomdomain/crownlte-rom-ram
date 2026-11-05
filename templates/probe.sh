@@ -13,7 +13,7 @@ ks=0; okd=0; ovd=0; n=0
 while true; do
   up=$(cut -d' ' -f1 /proc/uptime)
   echo "=== probe n=$n uptime=$up"
-  getprop | grep -E '^\[(init\.svc\.|apexd\.|keystore\.|odsign\.|ro\.crypto\.|sys\.boot|dev\.bootcomplete|vold\.|ro\.boot\.(hardware|mode|selinux|init_rc)|ro\.hardware|sys\.init\.|ro\.boottime\.init|persist\.sys\.boot\.reason|sys\.usb\.|ro\.kernel\.version|ro\.build\.type)'
+  getprop | grep -E '^\[(init\.svc\.|apexd\.|keystore\.|odsign\.|ro\.crypto\.|sys\.boot|dev\.bootcomplete|vold\.|ro\.boot\.(hardware|mode|selinux|init_rc)|ro\.hardware|sys\.init\.|ro\.boottime\.init|persist\.sys\.boot\.reason|service\.bootanim\.|sys\.system_server\.|sys\.usb\.|ro\.kernel\.version|ro\.build\.type)'
   echo "--- getenforce=$(cat /sys/fs/selinux/enforce 2>&1) loadavg=$(cat /proc/loadavg)"
   grep -E '^(MemTotal|MemFree|MemAvailable|Shmem|SwapTotal|SwapFree):' /proc/meminfo
   if [ $((n % 3)) -eq 0 ]; then

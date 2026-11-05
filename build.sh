@@ -36,7 +36,7 @@ if ! mountpoint -q "$TR"; then
 fi
 
 # 2. Payload.
-DEADLINE=${DEADLINE:-300} python3 gen_payload.py "$TR" payload
+DEADLINE=${DEADLINE:-600} python3 gen_payload.py "$TR" payload
 
 # 3. Host test of the manifest verifier against the real images (+ negatives).
 gcc -std=gnu11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined \

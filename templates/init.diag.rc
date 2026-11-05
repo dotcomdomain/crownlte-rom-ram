@@ -60,3 +60,28 @@ service crownlte_logcat /system/bin/logcat -b all -v threadtime -f /dev/crownlte
     group root log readproc
     seclabel u:r:su:s0
     disabled
+
+# v6 milestones (keymaster runs software-only; TEE clients disabled)
+on property:init.svc.vendor.keymaster-3-0=running
+    write /dev/kmsg "<6>crownlte-romram: keymaster@3.0 HAL running (software-only, no TEE module)"
+
+on property:init.svc.keystore2=running
+    write /dev/kmsg "<6>crownlte-romram: keystore2 running"
+
+on property:keystore.module_hash.sent=true
+    write /dev/kmsg "<6>crownlte-romram: keystore.module_hash.sent=true"
+
+on property:init.svc.vendor.hwcomposer-3=running
+    write /dev/kmsg "<6>crownlte-romram: HWC3 (vendor.hwcomposer-3) running"
+
+on property:init.svc.surfaceflinger=running
+    write /dev/kmsg "<6>crownlte-romram: surfaceflinger running"
+
+on property:init.svc.bootanim=running
+    write /dev/kmsg "<6>crownlte-romram: bootanim running"
+
+on property:sys.system_server.start_count=1
+    write /dev/kmsg "<6>crownlte-romram: system_server started"
+
+on property:service.bootanim.exit=1
+    write /dev/kmsg "<6>crownlte-romram: bootanim exit requested"

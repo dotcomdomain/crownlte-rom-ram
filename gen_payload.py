@@ -30,12 +30,43 @@ ABSENT = ['/odm/etc/init', '/init.samsungexynos9810.rc', '/init.samsung.rc']
 EXTRA_FILES = ['/init.environ.rc', '/system/build.prop', '/vendor/build.prop', '/odm/etc/build.prop',
                '/vendor/etc/fstab.samsungexynos9810', '/system/bin/init', '/system/etc/ueventd.rc',
                '/vendor/etc/ueventd.rc', '/system/etc/selinux/plat_sepolicy.cil',
-               '/vendor/etc/selinux/vendor_sepolicy.cil']
+               '/vendor/etc/selinux/vendor_sepolicy.cil',
+               # v6: TEE client chokepoints and VINTF manifests (see EMPTY / VINTF_DROP)
+               '/vendor/lib64/hw/keystore.mdfpp.so', '/vendor/lib64/libMcClient.so',
+               '/vendor/lib/libMcClient.so', '/vendor/etc/vintf/manifest.xml',
+               '/vendor/etc/vintf/manifest/android.hardware.biometrics.fingerprint-service.samsung.xml']
 EMPTY = {
     '/vendor/etc/init/vendor_flash_recovery.rc': 'service runs /vendor/bin/install-recovery.sh (rewrites RECOVERY)',
     '/system/etc/init/misctrl.rc': 'service misctrl (root, writes the misc partition)',
     '/system/etc/init/uncrypt.rc': 'services uncrypt/setup-bcb/clear-bcb (write the misc partition BCB)',
+    # v6: Trustonic TEE clients. The ROM stage already refuses to run if a TEE
+    # is present; these keep every TEE client from starting at all.
+    '/vendor/etc/init/mobicore.rc': 'service mobicore (mcDriverDaemon, Trustonic TEE daemon)',
+    '/vendor/etc/init/android.hardware.gatekeeper@1.0-service.rc':
+        'service vendor.gatekeeper-1-0 (gatekeeper.exynos9810.so, Trustonic TA client)',
+    '/vendor/etc/init/android.hardware.drm@1.2-service.widevine.rc':
+        'service vendor.drm-widevine-hal-1-2 (liboemcrypto, Widevine L1 TA client)',
+    '/vendor/etc/init/vendor.samsung.hardware.security.widevine.keyprovisioning@1.0-service.rc':
+        'service vendor.wvkprov_server_hal (Widevine key provisioning, TEE)',
+    '/vendor/etc/init/android.hardware.biometrics.fingerprint-service.samsung.rc':
+        'service vendor.fingerprint-default (libbauthserver/libbauthtzcommon, fingerprint TA client)',
+    '/vendor/lib64/hw/keystore.mdfpp.so':
+        'MDFPP keymaster TA client module (ro.hardware.keystore=mdfpp). Masked, hw_get_module_by_class() '
+        'fails and android.hardware.keymaster@3.0-impl logs "Could not find any keystore module, using '
+        'software-only implementation."; km_compat then uses that insecure HAL as the TEE device',
+    '/vendor/lib64/libMcClient.so': 'Trustonic client library (64-bit): every TEE client fails to load',
+    '/vendor/lib/libMcClient.so': 'Trustonic client library (32-bit): every TEE client fails to load',
 }
+# v6: HALs whose services are disabled above are also removed from the device
+# VINTF manifest, so nothing blocks in getService()/waitForDeclaredService().
+VINTF_DROP = {
+    '/vendor/etc/vintf/manifest.xml': ['android.hardware.drm', 'android.hardware.gatekeeper',
+                                       'vendor.samsung.hardware.security.widevine.keyprovisioning'],
+    '/vendor/etc/vintf/manifest/android.hardware.biometrics.fingerprint-service.samsung.xml':
+        ['android.hardware.biometrics.fingerprint'],
+}
+# v6: init.rc execs that would block boot on a TEE-backed HAL run in the background.
+BACKGROUND_EXECS = {('/system/bin/vdc', 'keymaster', 'earlyBootEnded')}
 DISARM_CMDS = {'mount_all', 'swapon_all', 'umount_all', 'remount_userdata'}
 DANGER_BINS = re.compile(r'(install-recovery|flash_recovery|misctrl|e2fsck|fsck|mke2fs|make_f2fs|mkfs|'
                          r'resize2fs|tune2fs|sgdisk|blkdiscard|sload_f2fs|e2fsdroid|uncrypt|^dd$)')
@@ -48,6 +79,28 @@ CMDLINE_EXTRA = ('androidboot.hardware=samsungexynos9810 androidboot.selinux=per
 
 sha = lambda b: hashlib.sha256(b).hexdigest()
 report = []
+
+
+def vintf_drop(cpath, text):
+    # Remove whole <hal>...</hal> blocks by <name>; each name exactly once.
+    names = VINTF_DROP[cpath]
+    hit = {n: 0 for n in names}
+
+    def cut(m):
+        nm = re.search(r'<name>\s*([^<\s]+)\s*</name>', m.group(0))
+        if nm and nm.group(1) in hit:
+            hit[nm.group(1)] += 1
+            report.append(f'{cpath}: VINTF drop {nm.group(1)}: ' + ' '.join(m.group(0).split()))
+            return ''
+        return m.group(0)
+
+    new = re.sub(r'[ \t]*<hal\b[^>]*>.*?</hal>[ \t]*\n', cut, text, flags=re.S)
+    for n, c in hit.items():
+        if c != 1:
+            raise SystemExit(f'VINTF drop {cpath} {n}: {c} matches')
+    if '<manifest' not in new or '</manifest>' not in new:
+        raise SystemExit('VINTF result lost the manifest element ' + cpath)
+    return new
 
 
 def host(cpath):
@@ -76,6 +129,13 @@ def sanitize(cpath, text):
             why = 'disarm block-device write'
         elif cmd in ('exec', 'exec_background') and any(DANGER_BINS.search(os.path.basename(t)) for t in tok[1:] if t.startswith('/')):
             why = 'disarm storage tool exec'
+        elif cmd == 'exec' and '--' in tok and tuple(tok[tok.index('--') + 1:]) in BACKGROUND_EXECS:
+            new = line.replace('exec ', 'exec_background ', 1)
+            out.append('    # crownlte-rom-ram: ' + s + ' -> exec_background (TEE-backed HAL must not block boot)\n')
+            out.append(new)
+            decisions.append(f'{cpath}:{no}: exec -> exec_background: {s}')
+            changed = True
+            continue
         elif cmd == 'init_user0':
             out.append('    # crownlte-rom-ram: ' + s + ' -> bounded vdc call without reboot-to-recovery\n')
             out.append(INIT_USER0 + '\n')
@@ -117,7 +177,18 @@ def main():
         if cpath in EMPTY:
             action = 'empty'
             report.append(f'{cpath}: EMPTY overlay: {EMPTY[cpath]}')
-            sanitize(cpath, data.decode('utf-8', 'replace'))
+            if cpath.endswith('.rc'):
+                sanitize(cpath, data.decode('utf-8', 'replace'))
+        elif cpath in VINTF_DROP:
+            new = vintf_drop(cpath, data.decode('utf-8'))
+            # romram.h reads replacement names with %63s: keep them short
+            rname = 'vintf_' + sha(cpath.encode())[:16] + '.xml'
+            report.append(f'{cpath}: VINTF replacement sanitized/{rname}')
+            (pay / 'sanitized' / rname).write_text(new)
+            repls[rname] = new.encode()
+            action = 'replace:' + rname
+            report.append(''.join(difflib.unified_diff(
+                data.decode().splitlines(True), new.splitlines(True), cpath, 'sanitized/' + rname)))
         elif cpath.endswith('.rc') or cpath == '/init.environ.rc':
             new, dec = sanitize(cpath, data.decode('utf-8'))
             report.extend(dec)
@@ -154,10 +225,15 @@ def main():
         lines.append(f'A {c}')
     for c in EMPTY:
         assert c in seen, 'EMPTY target not found ' + c
+    for c in VINTF_DROP:
+        assert c in seen, 'VINTF target not found ' + c
+    assert any('exec -> exec_background' in r and 'earlyBootEnded' in r for r in report), \
+        'vdc keymaster earlyBootEnded not found'
     # build type must allow androidboot.selinux=permissive
     bp = host('/system/build.prop').read_text()
     assert 'ro.build.type=userdebug' in bp, 'system is not userdebug'
     for name, body in sorted(repls.items()):
+        assert len(name) <= 63, 'replacement name too long for romram.h: ' + name
         lines.append(f'R {sha(body)} {len(body)} {name}')
     manifest = ('\n'.join(lines) + '\n').encode()
     (pay / 'manifest.txt').write_bytes(manifest)
