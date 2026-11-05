@@ -615,3 +615,85 @@ powershell -ExecutionPolicy Bypass -File C:\Users\Patrick\tools\trial-romram-202
 ## Abort / return path
 Unchanged: container SIGKILL at 575 s, restart at 600 s, watchdog/panic fallbacks, then restore bright RECOVERY
 (8763860c). The loop device and the RAM copy disappear with the restart.
+
+---
+
+# v11: undeclare absent Lineage HALs and the fingerprint feature (2026-11-05)
+
+Builds on v10 (recovery be1f1b4c, ran 22:27-22:38). The kernel (79ac61fa) and DTB (a6a888a8) are unchanged. Only
+the payload overlays changed. Code under review: rom-ram src `75d4c56..4903522` (one commit, `gen_payload.py`).
+No kernel commits.
+
+Image: gekko `rom-ram/pack-romram-20261104k/recovery.img`
+sha256 `d888449d502362c969287cecf583361b09ec6bbaa5a0e993ce8c6bdcc78f3759` (68,149,248 bytes).
+Windows: `C:\Users\Patrick\tools\trial-romram-20261104\v11\recovery.img` (+ manifest.json, hash verified).
+
+| input | sha256 |
+|---|---|
+| kernel Image (as v9/v10) | 79ac61fa1d6f998adbe6e09bf855ca76c074e963c768ad700f89ee19c9e72be6 |
+| DTB (as v7-v10) | a6a888a8b7c92b1242949e43a74791c6ff492407595dd65fcfa3698e223f3ac4 |
+| ramdisk rom-ram/build-7 (src 4903522; reproducible) | 18767af1219dff8e8087c49114a70b8553c345e9fed3f73bfd394833213a5049 |
+| /init (unchanged since v10) | 8c7545800448d2d5ef0ef705281338c7ecb5de4c61ebb6373fd705cb23accb33 |
+| payload manifest (153 entries, 148 hashed) | 999770c65483f52b1e7123cc074a1f3d3ef10583d8ba84209dd7c02dbd037c11 |
+| shim bbea959 (loader) | 662216b31cd47426f0125fe2b2ccb52f69ce2c60100ce8215042aaaf0885d366 |
+
+## v10 findings
+- FRP worked: stock PersistentDataBlockService read the real block and logged "FRP secret matched, FRP
+  deactivated". Phases 480/500/520 passed and "System now ready" was reached.
+- **Watchdog kills (~90 s):** the main thread was stuck in `waitForDeclaredService(vendor.lineage.touch.IGloveMode/default)`
+  (InputMethodManagerService.updateTouchSensitivity -> LineageHardwareManager). `vendor.touch-hal` runs but
+  registers nothing without `/sys/class/sec/tsp/cmd`, because touch is off in the DT. servicemanager logged
+  ~1,000 failed lazy starts.
+- **Second permanent wait:** system_server thread 981 (FingerprintService/FingerprintSensorConfigurations) waited
+  for `android.hardware.biometrics.fingerprint.virtualhal.IVirtualHal/virtual` (~1,000 lazy-start failures).
+  FingerprintService adds a "virtual" instance; with no real IFingerprint declared (its HAL is a TEE client,
+  undeclared since v6) it maps to IVirtualHal/virtual, which this build does not ship.
+- Every other AIDL instance system_server queried resolved: IHealth, ILights, IMemtrack, IPower, IThermal, IUsb,
+  IVibrator, IWifi, ISupplicant (lazy), ISystemSuspend, IStats, lineage IChargingControl/IFastCharge, ... No HIDL
+  wait persisted (sensors/audio resolved after one retry).
+- **Not yet queried, same failure mode:** `vendor.lineage.livedisplay` (Samsung exynos impl). It runs but registers
+  nothing: each interface needs a `/sys/class/mdnie/mdnie/*` node, and there is no mdnie driver on 6.12.
+  LiveDisplayService/LineageHardwareService would block on it next.
+
+## v11 changes (RAM overlay only; each one listed)
+| item | change | reason |
+|---|---|---|
+| `/vendor/etc/vintf/manifest.xml` | drop `<hal>` vendor.lineage.touch (IGloveMode, ITouchscreenGesture) | touch hardware off; declared, never registered -> main-thread Watchdog |
+| same | drop `<hal>` vendor.lineage.livedisplay (IDisplayColorCalibration, IDisplayModes, IReadingEnhancement, ISunlightEnhancement) | no mdnie on 6.12; would be the next stall |
+| `vendor.lineage.touch-service.samsung.rc` | EMPTY | undeclared service must not try to register |
+| `vendor.lineage.livedisplay-service.samsung-exynos.rc` | EMPTY | same |
+| `/vendor/etc/permissions/android.hardware.fingerprint.xml` | drop `<feature name="android.hardware.fingerprint"/>` (now `<permissions></permissions>`) | SystemServer then does not start FingerprintService, so no IVirtualHal wait. This is what a device without a usable fingerprint sensor declares |
+
+LineageHardwareManager reports the touch/livedisplay features as unsupported (not declared -> no wait). The
+generator asserts each removal matches exactly once and that every XML still parses. All replacements are
+sha256-verified before init runs. Unchanged: FRP (rr_frp_setup), TEE refusal and keymaster, storage guards,
+init.c, romram.h, kernel, DTB.
+
+## How to run
+As v6-v10:
+```
+powershell -ExecutionPolicy Bypass -File C:\Users\Patrick\tools\trial-romram-20261104\romram-capture.ps1 -Seconds 630 -Out C:\Users\Patrick\tools\trial-romram-20261104\v11\serial-romram-v11.bin
+```
+`C:\Users\Patrick\tools\run-trial.sh` refuses to start trials after 2026-11-05 06:10. Do not edit it during a trial.
+
+## Expected milestones
+- ROM stage:
+  - `manifest verified: 148 files hashed`;
+  - `rc overlay` lines now include `vendor.lineage.touch-service.samsung.rc -> empty`,
+    `vendor.lineage.livedisplay-service.samsung-exynos.rc -> empty` and
+    `/vendor/etc/permissions/android.hardware.fingerprint.xml -> replace`;
+  - the FRP lines as in v10.
+- No `init.svc.vendor.touch-hal` or `init.svc.vendor.livedisplay-hal-samsung-exynos` in the probe getprop.
+- No `IGloveMode` or `IVirtualHal` lazy-start spam, no `StartFingerprintSensor`, no Watchdog `Blocked in handler on
+  main thread`.
+- system_server: "System now ready", then `systemRunning` completes, then boot phase 1000. Watch for
+  `crownlte-romram: sys.boot_completed=1` and `bootanim exit requested`. After that, the launcher/setup wizard
+  should be on screen via the AFBC bounce path.
+- Possible next blockers:
+  - another system_server waiter (look for `Waited one second for` / Watchdog traces);
+  - SystemUI/launcher crashes on missing HALs (camera, audio);
+  - the setup wizard.
+
+## Abort / return path
+Unchanged: container SIGKILL at 575 s, restart at 600 s, watchdog/panic fallbacks, then restore bright RECOVERY
+(8763860c).
