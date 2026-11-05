@@ -519,3 +519,99 @@ Do not edit it while a trial is running.
 ## Abort / return path
 Unchanged: container SIGKILL at 575 s, restart at 600 s, watchdog/panic fallbacks, then restore bright RECOVERY
 (8763860c).
+
+---
+
+# v10: real FRP block for PersistentDataBlockService, as a verified RAM copy (2026-11-05)
+
+Builds on v9 (recovery d7e1b46d, ran 22:06-22:18). The kernel (79ac61fa) and DTB (a6a888a8) are unchanged. Only
+the ROM stage (ramdisk) changed.
+
+Image: gekko `rom-ram/pack-romram-20261104j/recovery.img`
+sha256 `be1f1b4c6cf8ada6a03dd32c294003f900257e37f8b90fd01bf754f2a4b42fde` (68,149,248 bytes).
+Windows: `C:\Users\Patrick\tools\trial-romram-20261104\v10\recovery.img` (+ manifest.json, hash verified).
+
+| input | sha256 |
+|---|---|
+| kernel Image (as v9; build/romram-6.12.93/v9/) | 79ac61fa1d6f998adbe6e09bf855ca76c074e963c768ad700f89ee19c9e72be6 |
+| DTB (as v7-v9) | a6a888a8b7c92b1242949e43a74791c6ff492407595dd65fcfa3698e223f3ac4 |
+| ramdisk rom-ram/build-6 (src f057a31) | 6615c508a263f48cd863b77fa0dcaa76aa7fcafbe6a76b7f15abf47db5c7e4fa |
+| /init (PID1 + ROM stage) | 8c7545800448d2d5ef0ef705281338c7ecb5de4c61ebb6373fd705cb23accb33 |
+| payload manifest (unchanged) | d727af14e82eb8644ba653ab753edb18755b55ce4d56ffc6b01e0e345cf22c9a |
+| shim bbea959 (loader) | 2e63b23eefad84597d40ce74d00de1fee2fbf81f2fc813a84afdaa0054c7e382 |
+
+## v9 finding
+system_server died 33x in boot phase 500: `IllegalStateException: Service PersistentDataBlockService init timeout`.
+The chain was:
+1. `/dev/block/persistent: open failed: ENOENT`;
+2. "persistent partition not readable" / "Formatting FRP partition..." / "failed to format block";
+3. onStart never signalled, so phase 500 waited 10 s and threw.
+
+`ro.frp.pst=/dev/block/persistent` (vendor build.prop). init.samsungexynos9810.rc creates it `on init` as a symlink
+to `/dev/block/platform/11120000.ufs/by-name/PERSISTENT`. That target never existed: the ROM stage hides the UFS from
+Android (masks `/sys/devices/platform/soc@0/11120000.ufs`, `/sys/bus/scsi`, the scsi/bsg classes), so ueventd sees
+no sd* devices and creates no by-name links. Every other service phase-500 service completed.
+
+## What v10 does for FRP (not a bypass)
+- **Untouched:** `ro.frp.pst`, PersistentDataBlockService and its FRP logic. The service reads the device's real
+  FRP block and decides FRP state with stock code.
+- **ROM stage (`rr_frp_setup`, romram.h):**
+  1. Find exactly one partition named PERSISTENT among the scanned UFS nodes (`rr_blocks`). BLKROSET=1 is already
+     set and verified on every sd* node.
+  2. Open it `O_RDONLY`. Check it is the expected block device, `BLKROGET == 1`, and 4 KiB ≤ size ≤ 4 MiB
+     (the backup is 524288 bytes).
+  3. Read 1: sha256 of the partition. Read 2: copy into `/crownlte-frp/persistent.img`. That is a private tmpfs
+     outside the container root: after the chroot Android cannot reach it, and only the loop device holds it.
+     The copy is re-hashed and must match.
+  4. Attach the copy **read-write** to a free loop device (LOOP_CONFIGURE, file name `crownlte-frp-ram-copy`, no
+     autoclear). Read 3: sha256 through the loop device must match.
+  5. Create only `/dev/block/platform/11120000.ufs/by-name/PERSISTENT` in the container (0660 system:system, as the
+     vendor ueventd rule), pointing at that loop. init's own symlink then makes `/dev/block/persistent` work.
+- **Writes** by the service (format, OEM-unlock bit, FRP data) go into the RAM copy and are gone at the restart.
+  The real PERSISTENT is never opened writable; BLKRO and the SCSI write guard are unchanged.
+- **Failure handling:** on any failure the node is just absent (v9 behaviour), never a fake or empty block. The log
+  says `FRP: /dev/block/persistent NOT provided: step ...`.
+- **Not exposed (listed on purpose):**
+  - `by-name/RADIO`: cbd/cpboot-daemon, modem boot; no modem driver.
+  - `by-name/MISC`: kcmdlinectrl; misc/BCB must never be touched.
+  - `/dev/block/steady` (init symlink to STEADY): no reader seen.
+  - PARAM and everything else.
+- **Host test on gekko:**
+  - Setup: the 2026-11-03 PERSISTENT backup behind a read-only loop, private mount namespace, test paths.
+  - Hashes: 3x sha256 `81e8d623…` (= backup). Header: PDB magic `19901873`, data_len 77, OEM-unlock byte 1.
+  - Node: `brw-rw---- 1000 1000 7,4`.
+  - A 4 KiB write through the node changed only the RAM copy. The source stayed `81e8d623…`, and a write to it
+    failed with EPERM.
+
+Note: this device has OEM unlocking enabled (last byte 1). On unlocked devices, stock PersistentDataBlockService may
+format the block at boot. Under 4.9 that write goes to the real partition; here it goes to the RAM copy. Either FRP
+outcome the service reaches (active or not) is the device's real one.
+
+## How to run
+As v6-v9:
+```
+powershell -ExecutionPolicy Bypass -File C:\Users\Patrick\tools\trial-romram-20261104\romram-capture.ps1 -Seconds 630 -Out C:\Users\Patrick\tools\trial-romram-20261104\v10\serial-romram-v10.bin
+```
+`C:\Users\Patrick\tools\run-trial.sh` refuses to start trials after 2026-11-05 06:10. Do not edit it during a trial.
+
+## Expected milestones
+- ROM stage, after `BLKROSET=1 verified on all 31 sd* nodes`:
+  - `FRP: real PERSISTENT (sdaN, 524288 bytes) sha256=... read read-only (BLKRO=1), copied to a private RAM tmpfs
+    and verified 3x`
+  - `FRP: RAM copy attached read-write as loopN (7:N, ...); ... by-name/PERSISTENT -> loopN (0660 system:system)`
+    (N is probably 0: the APEXes take the next loops)
+  - `FRP: PDB header magic=19901873 data_len=... oem_unlock_byte=...`
+- First probe (`P;`): `--- frp ro.frp.pst=/dev/block/persistent`, the symlink and `brw-rw---- system system 7, N`.
+- Kernel, everything from v9: `ashmem: initialized (C driver ...)`, colours kept, brightness PASS, AFBC bounce.
+- system_server: no `/dev/block/persistent: open failed`, no `PersistentDataBlockService init timeout`.
+  `OnBootPhase_500` completes, followed by phases 520/550/600: `ActivityManager: System now ready`, then
+  `crownlte-romram: sys.boot_completed=1` and `bootanim exit requested`.
+- Possible next blockers (not visible in v9 because it died at 500):
+  - the setup wizard stopping at FRP if FRP is active (acceptable for a diag boot);
+  - LockSettings/gatekeeper (no gatekeeper HAL: credential checks fail fast);
+  - missing HALs (camera, audio, wifi, USB gadget HAL: handled, logged as "service not found");
+  - the PackageManager/dexopt first-boot time in RAM.
+
+## Abort / return path
+Unchanged: container SIGKILL at 575 s, restart at 600 s, watchdog/panic fallbacks, then restore bright RECOVERY
+(8763860c). The loop device and the RAM copy disappear with the restart.
