@@ -12,6 +12,9 @@ import /product/etc/init
 
 on early-init
     write /dev/kmsg "<6>crownlte-romram: Lineage init second stage reached early-init"
+    # v7: no input devices yet (no gpio-keys/touch). The vendor vibrator HAL
+    # iterates /dev/input in its constructor and aborts if it is missing.
+    mkdir /dev/input 0755 root root
 
 on init
     start crownlte_probe
@@ -85,3 +88,13 @@ on property:sys.system_server.start_count=1
 
 on property:service.bootanim.exit=1
     write /dev/kmsg "<6>crownlte-romram: bootanim exit requested"
+
+# v7 milestones
+on property:init.svc.zygote_secondary=running
+    write /dev/kmsg "<6>crownlte-romram: zygote_secondary (32-bit) running"
+
+on property:init.svc.vendor.thermal-hal=running
+    write /dev/kmsg "<6>crownlte-romram: thermal HAL running"
+
+on property:init.svc.vendor.vibrator-default=running
+    write /dev/kmsg "<6>crownlte-romram: vibrator HAL running"

@@ -68,6 +68,15 @@
 	samsung,fault-display-brightness-at-ms = <1000>;
 };
 
+/*
+ * v7: the vendor thermal HAL (thermal_info_config.json) needs a cooling
+ * device named thermal-isp-0 (4.9 isp_cooling) or it aborts. No ISP driver
+ * exists; the TMU driver registers a single-state stub (never throttles).
+ */
+&tmu_isp {
+	samsung,stub-cooling-device = "thermal-isp-0";
+};
+
 &trustonic_tee { status = "disabled"; };
 &usi_touch { status = "disabled"; };
 &hsi2c_touch { status = "disabled"; };
