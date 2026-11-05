@@ -448,3 +448,74 @@ Likely next blockers:
 ## Abort / return path
 Unchanged from v6: container SIGKILL at 575 s, restart at 600 s, watchdog/panic fallbacks, then restore bright
 RECOVERY (8763860c).
+
+---
+
+# v9: /dev/ashmem through a C ashmem driver (2026-11-05)
+
+Builds on v8 (owner-packed, recovery 34aa0385 = v7 + display 4e8632cae AFBC/bounce). The DTB and ramdisk are
+unchanged since v7. Only the kernel differs.
+
+Image: gekko `rom-ram/pack-romram-20261104i/recovery.img`
+sha256 `d7e1b46db521ea60c7fda1efed433059350ebab023b9b12b37234db126e8534f` (68,149,248 bytes).
+Windows: `C:\Users\Patrick\tools\trial-romram-20261104\v9\recovery.img` (+ manifest.json, hash verified).
+
+| input | sha256 |
+|---|---|
+| kernel Image: crownlte-display-flipfix 314998e83/ab8a0940e (v8 source + C ashmem), config = v8 + STAGING + ASHMEM_C, build/romram-6.12.93 (snapshot v9/) | 79ac61fa1d6f998adbe6e09bf855ca76c074e963c768ad700f89ee19c9e72be6 |
+| .config | cc02f2ea7b8d7cf8d57c2a8140afb2a3f2433a0071da5cf77577b9fde75b4b4f |
+| DTB (as v7/v8) | a6a888a8b7c92b1242949e43a74791c6ff492407595dd65fcfa3698e223f3ac4 |
+| ramdisk build-5 (as v7/v8) | 623bb9dbe480f6ac818c49562790eff55c4fafa16128ebd3cbb00760fc697b9b |
+| shim bbea959 (loader) | 1a7a34d6ea6e011506802276eb375fb06d252ae1ea946f9acd2f34390b5761a8 |
+
+## Root cause and choice
+In v8, system_server died every ~5 s right after InitBeforeStartServices with `Failed to create ashmem: No such
+file or directory` (ApplicationSharedMemory.nativeCreate), after libcutils logged `Unable to stat ashmem device`.
+android16-6.12 only has the Rust ashmem (`CONFIG_ASHMEM depends on SHMEM && RUST`), so there was no /dev/ashmem.
+
+- **(a) userspace only: not possible.** The Lineage system libcutils.so (disassembled `has_memfd_support()`) uses
+  memfd only if `GetBoolProperty("sys.use_memfd", false)` is true **and** a test memfd (MFD_CLOEXEC |
+  MFD_ALLOW_SEALING, F_SEAL_FUTURE_WRITE, ftruncate) answers `ioctl(ASHMEM_GET_SIZE)` with the page size.
+  Otherwise it opens `/dev/ashmem<boot_id>` (fallback `/dev/ashmem`). On 6.12 that memfd ioctl exists only under
+  CONFIG_ASHMEM, through the Rust `ashmem_memfd_ioctl()` hook in mm/shmem.c. Setting sys.use_memfd would still end
+  at /dev/ashmem.
+- **(b) chosen: C ashmem driver**, `drivers/staging/android/ashmem_c.c`, `CONFIG_ASHMEM_C` (depends on
+  SHMEM && !ASHMEM), commit 314998e83. It is the mainline-staging/ACK (≤ android15-6.6) C driver: one
+  ashmem_mutex, preallocated ranges, a shrinker that drops the lock around the punch-hole, ASHMEM_GET_FILE_ID and
+  fdinfo as in ACK.
+  - 6.12 updates: shrinker_alloc/register/free, vm_flags_clear, read_iter via vfs_iter_read,
+    mm_get_unmapped_area, and the 32-bit GET_FILE_ID writes a compat_ulong_t.
+  - mmap keeps the upstream shmem_zero_setup()/vma_set_anonymous() + vma_set_file() sequence; 6.12
+    __mmap_region() explicitly supports ->mmap replacing vm_file.
+  - The 4.9 crownlte driver was a cross-reference only: its split-lock variant reads asma->file/size unlocked.
+  - checkpatch --strict: 0 errors, 1 warning (non-const runtime copy of the shmem fops, as upstream). W=1
+    clang-18 compile clean, full build 0 warnings.
+  - Also enabled in crownlte_android_defconfig (ab8a0940e), so the real Lineage kernel gets it too.
+- (c) Rust toolchain: not needed.
+
+Config delta vs v8: `STAGING n -> y`, `ASHMEM_C y`. Every other staging driver stays n.
+
+## How to run
+As v6/v7 (600 s deadline):
+```
+powershell -ExecutionPolicy Bypass -File C:\Users\Patrick\tools\trial-romram-20261104\romram-capture.ps1 -Seconds 630 -Out C:\Users\Patrick\tools\trial-romram-20261104\v9\serial-romram-v9.bin
+```
+Note: `C:\Users\Patrick\tools\run-trial.sh` refuses to start trials after 2026-11-05 06:10 (owner deadline 06:30).
+Do not edit it while a trial is running.
+
+## Expected milestones
+- Kernel: `ashmem: initialized (C driver, /dev/ashmem minor N)`.
+- ueventd creates `/dev/ashmem<boot_id>` (rule `/dev/ashmem* 0666 root root`, sepolicy ashmem_device /
+  ashmem_libcutils_device; permissive anyway).
+- Absent: `Unable to stat ashmem device`, `Failed to create ashmem`, the ~5 s system_server restart loop.
+- Everything that passed in v8 again: 32-bit zygote stable, surfaceflinger, HWC3, bootanim with the AFBC bounce
+  copies (`win0: scattered buffer (... AFBC) copied to 0xed000000`).
+- system_server gets past InitBeforeStartServices: `SystemServerTiming` StartServices, bootstrap/core/other
+  services, `ActivityManager: System now ready`. Then the stretch goal: `crownlte-romram: sys.boot_completed=1`
+  and bootanim exit (`bootanim exit requested`), after which the launcher would be next.
+- Likely next blockers: system_server services whose HALs are missing (camera, audio, sensors, wifi, gatekeeper /
+  LockSettings), PackageManager first-boot scan time in RAM (dexopt), and odsign (bypassed after 60 s).
+
+## Abort / return path
+Unchanged: container SIGKILL at 575 s, restart at 600 s, watchdog/panic fallbacks, then restore bright RECOVERY
+(8763860c).
