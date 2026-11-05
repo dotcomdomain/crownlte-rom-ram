@@ -817,7 +817,7 @@ static void forward_poll(struct forward *f, pid_t pid)
 /* ------------------------------------------------------------- main ----- */
 int main(void)
 {
-        int console, reader, serial = -1, bound = 0, uname_valid;
+        int console, console_error = 0, reader, serial = -1, bound = 0, uname_valid;
         int mount_errors[3], directory_errors[3], config_error;
         struct devkmsg_status devkmsg;
         int usb_previous_valid = 0, serial_previous_error = 0;
@@ -858,11 +858,30 @@ int main(void)
         mount_errors[1] = mount_virtual("sysfs", "/sys", MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL);
         mount_errors[2] = mount_virtual("devtmpfs", "/dev", MS_NOSUID, "mode=0755");
         console = open("/dev/console", O_RDWR | O_NOCTTY);
+        console_error = console < 0 ? errno : 0;
         if (console >= 0) {
                 dup2(console, 0); dup2(console, 1); dup2(console, 2);
                 if (console > 2) close(console);
+        } else {
+                /*
+                 * v4 kernel has CONFIG_VT=n (as 4.9): no console tty, so the
+                 * kernel could not hand PID1 fds 0-2 either. Pin them to
+                 * /dev/null before kmsg/serial are opened, so no later fd
+                 * becomes stdio (announce() copies every line to fd 2).
+                 */
+                int null = open("/dev/null", O_RDWR | O_NOCTTY);
+                if (null >= 0) {
+                        for (int fd = 0; fd < 3; fd++)
+                                if (fd != null && fcntl(fd, F_GETFD) < 0)
+                                        dup2(null, fd);
+                        if (null > 2) close(null);
+                }
         }
         kmsg = open("/dev/kmsg", O_WRONLY | O_CLOEXEC);
+        if (console < 0)
+                announce("no /dev/console (errno=%d, kernel without VT); stdio pinned to /dev/null fd0=%d fd1=%d fd2=%d",
+                         console_error, fcntl(0, F_GETFD) >= 0, fcntl(1, F_GETFD) >= 0,
+                         fcntl(2, F_GETFD) >= 0);
         announce("printk_devkmsg write_errno=%d read_errno=%d mode=%s unlimited_confirmed=%d",
                  -devkmsg.write_error, -devkmsg.read_error,
                  devkmsg.read_error ? "unavailable" : devkmsg.value,

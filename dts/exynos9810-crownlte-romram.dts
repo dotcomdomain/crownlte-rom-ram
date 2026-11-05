@@ -1,0 +1,78 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * crownlte ROM-in-RAM v4 DTB: Lineage userspace on the 6.12 kernel, booted
+ * from RAM, UFS write-guarded.
+ *
+ * Base: the q47-verified combined diagnostic DTB (crownlte-display-flipfix,
+ * exynos9810-crownlte-delayed-ufs-combined-diag.dts, sha 4530f0c5...). Only
+ * the self-tests that drive hardware Android drives too are removed:
+ *  - DECON A/B flip self-test (108 s): HWC owns WIN_CONFIG on fb0;
+ *  - cpuidle staged self-test (90 s): it is the only path that arms C2.
+ *    samsung,c2-boot-cpus cannot be used: cpuidle/ links before
+ *    clocksource/, so at cpuidle probe the MCT broadcast is not ready and
+ *    boot arming is refused. All CPUs stay on WFI (deep idle off);
+ *  - Mali self-test (109 s): kbase power-up/down and G3D DVFS steps under a
+ *    running gralloc/HWC/SurfaceFlinger;
+ *  - cpufreq (100 s) and devfreq MIF/INT (105 s) self-tests: they step
+ *    frequencies under the Android power HAL (q47 one-off: cpufreq -ERANGE
+ *    while the devfreq self-test held MIF).
+ * Kept (read-only reports): MCT broadcast report (86 s), ACPM TMU, S2MPS18
+ * PMIC/RTC, SoC ADC and MAX77705 battery self-tests.
+ *
+ * Kept unchanged on purpose:
+ *  - UFS host with crownlte,read-only-diagnostic: first probe held until the
+ *    host frame, SCSI write guard armed (ufshcd.c);
+ *  - display stage 2 adopt + samsung,fb-takeover: fb0 owns the boot window,
+ *    /dev/graphics/fb0 offers the 4.9 S3CFB_WIN_CONFIG ABI to HWC;
+ *  - panel brightness 44700 sequence at 1 s (stops the panel flicker);
+ *  - CL0 watchdog: started at boot, 30 s, pinged by the kernel (the ROM
+ *    stage shadows /dev/watchdog*, so Android cannot open it); no expiry test;
+ *  - Mali r38p1 with the runtime G3D power domain; ACPM DVFS/cpufreq/devfreq
+ *    and TMU drivers; PMIC/RTC read-only; SoC ADC + MAX77705 read-only.
+ * Off: Trustonic TEE (the ROM stage also refuses to run if it is present),
+ * touchscreen, DPU SysMMU, the stage 1 handover helper, LITTLE C2.
+ */
+#include "exynos9810-crownlte-delayed-ufs-combined-diag.dts"
+
+&{/} {
+	model = "Samsung Note9 ROM-in-RAM v4 (integration-2 + display flipfix)";
+};
+
+&decon_f {
+	/delete-property/ samsung,decon-selftest;
+};
+
+&cpuidle {
+	/delete-property/ samsung,cpuidle-selftest;
+	/delete-property/ samsung,cpuidle-selftest-soak-ms;
+	/delete-property/ samsung,cpuidle-selftest-keep-armed;
+	/delete-property/ samsung,c2-boot-cpus;
+};
+
+&gpu {
+	/delete-property/ samsung,mali-selftest;
+	/delete-property/ samsung,selftest-khz;
+};
+
+&{/cpufreq} {
+	/delete-property/ samsung,cpufreq-selftest;
+};
+
+&legacy_devfreq_mif {
+	/delete-property/ samsung,devfreq-selftest;
+};
+
+/* Same values as the base; restated so a base change cannot drop them. */
+&{/panel_drv@001} {
+	samsung,fault-display-brightness = <44700>;
+	samsung,fault-display-brightness-at-ms = <1000>;
+};
+
+&trustonic_tee { status = "disabled"; };
+&usi_touch { status = "disabled"; };
+&hsi2c_touch { status = "disabled"; };
+&touchscreen { status = "disabled"; };
+&sysmmu_dpu0 { status = "disabled"; };
+&sysmmu_dpu1 { status = "disabled"; };
+&sysmmu_dpu2 { status = "disabled"; };
+&decon_handover { status = "disabled"; };
