@@ -2,6 +2,15 @@
 # Output is forwarded by PID1 on the existing P; channel; RAM only, bounded.
 exec >>/dev/crownlte/probe.txt 2>&1
 echo 'T2 audit start; polling + strace (failed attempts included; write buffers raw)'
+# Storage nodes must be invisible in the container (sysfs masks); refuse otherwise.
+sd=$(ls -R /dev/block 2>/dev/null | grep -c '^sd')
+byname=$(ls -R /dev/block 2>/dev/null | grep -c '^by-name')
+echo "T2 container /dev/block: sd* nodes=$sd by-name dirs=$byname"
+if [ "$sd" != 0 ] || [ "$byname" != 0 ]; then
+    ls -lR /dev/block 2>&1 | head -60
+    echo 'T2 FAIL storage block nodes visible in container; daemon NOT started'
+    exit 125
+fi
 for d in /data/vendor/mcRegistry /data/misc/mcRegistry /data/local/tmp/debugsession; do
     mkdir -p "$d" || exit 125
     chown system:system "$d"

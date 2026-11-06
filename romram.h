@@ -1032,8 +1032,10 @@ static int romram_child(void *unused)
         /* A read-only regular-file mount permanently occupies the user-session node. */
         RR_DO("tee-t2-no-clients", rr_write(RR_ROOT "/dev/mobicore-user", "", 0, 0000));
         RR_DO("tee-t2-no-clients-mask", rr_mask_file(RR_ROOT "/dev/mobicore-user"));
-        RR_DO("tee-t2-block-dir", rr_mkdirs(RR_ROOT "/dev/block", 0755));
-        RR_DO("tee-t2-block-mask", rr_mask_dir(RR_ROOT "/dev/block"));
+        /* /dev/block stays a normal container tmpfs: apexd-bootstrap needs loop/dm
+         * nodes there (T2c: a RO /dev/block made init reboot at 18 s). Storage
+         * nodes cannot appear: the UFS/SCSI sysfs masks below hide them from
+         * ueventd, as in every default ROM-RAM run; tee-t2.sh re-checks. */
 #else
         (void)rr_frp_setup(nblk);
 #endif
@@ -1104,7 +1106,7 @@ static int romram_child(void *unused)
         RR_DO("tee-t2-efs-alias", rr_mkdirs(RR_ROOT "/mnt/vendor/efs", 0755));
         RR_DO("tee-t2-efs-bind", rr_bind_ro(RR_ROOT "/efs", RR_ROOT "/mnt/vendor/efs"));
         /* /data, including both registry layouts and TbStorage, is already tmpfs. */
-        rr_log("T2 PASS forbidden blocks hidden; FRP real partition never opened");
+        rr_log("T2 PASS UFS/SCSI sysfs masked (storage nodes hidden from ueventd; tee-t2.sh re-checks /dev/block); FRP real partition never opened");
 #endif
 
         /* 6. Switch root and exec Lineage init's selinux_setup. */
