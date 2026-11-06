@@ -801,3 +801,91 @@ There is no exported UFS guard counter in this kernel. The audit explicitly
 reports unavailable; `diagnostic rejects SCSI opcode` on K; is a ratelimited
 lower bound, not a precise counter. Never read trustonic crashdump or active_cpu.
 Do not treat absent EFS-write errors as proof that all daemon paths executed.
+
+## TEE T3: keymaster/gatekeeper TAs through dedicated clients (build-only, 2026-11-06)
+
+Design: `roadmap/tee-t3-design.md`. Report: `src/TEE-T3-REPORT.md`. Kernel `crownlte-tee-3`
+fa72731b5 (blob-pinned guard on 566ee45af); ramdisk branch `tee-t3` on tee-t2 3259275
+(romram-adb NOT merged). Opt-in: `TEE_T2=1 TEE_T3=<a0|a1|a2|b0|b1> DEADLINE=600 ./build.sh <fresh dir>`.
+Without TEE_T3 the T2 ramdisk is byte-identical (e6c0c93d = T2j build-17, checked) and the default
+ramdisk too (72195507, checked). **Nothing here has run on the phone or an emulator.**
+
+One pack per stage. Run them in order, one trial each, and stop on any surprise. Every stage uses the
+same kernel Image and the same serial capture procedure as T2 (READY -> PROBE -> START, keep capturing
+through the 600 s deadline restart). **T3b-1 sends a TA command and needs its own go.**
+
+| stage | pack `rom-ram/pack-romram-tee-<stage>/recovery.img` | ramdisk | DTB `exynos9810-crownlte-romram-tee-<stage>.dtb` | what runs |
+|---|---|---|---|---|
+| t3a0 | a76a1c975ce07bfe9abf5f18795e367f0ca6afec2660937072fc906ffae30ace | build-20 aa4a08ed | 91e4ebcc (KM pin) | KM TA open + close |
+| t3a1 | 8f67ef519994a55df7bb650d57e292755713aac89c34361633708f5f57de0ec0 | build-21 bbc7dd61 | 91e4ebcc (same bytes as a0) | KM open + addRngEntropy(32 B) + close |
+| t3a2 | d06b126ea01f12ba2c154a2debe399af240fced45dc944417164fdad3b87b6b1 | build-22 dd4a6d0c | 0fd173cf (KM + sec/TIMA/CM) | daemon -r sec 01, TIMA d..0a, CM d..16; KM open + configure(160000, 202608) + addRngEntropy + close |
+| t3b0 | d831d685767d5b72cfa0d12e83a41c2d6778d72fe4ffca974d4bee67123c33a4 | build-23 7b3bb2cb | 5f637991 (GK pin) | GK TA open + close, no TCI command |
+| **t3b1** | 9e7e2d38c5b67436e7f653fc58749e7d8cba8a0b3fd6ef416e79d7d2fb94443b | build-24 8c380f63 | 1a40fcf7 (GK + CM) | **SEPARATE GO.** daemon -r CM d..16; GK open + **ONE verify** (fake uid 0x7ffffff0) + close |
+
+Common: Image a466abe215a07834072cd4188c0f18a16180359ef22e15d61a13b9655ea60334
+(`panel-bright-work/ko-tee-t3pin`), shim bbea9590, parent a8198be0, restore 8763860c (as T2j).
+All DTBs = tee-t3dbg 06a6cf36 + only the stage's `samsung,tee-trustlet-allow` /
+`samsung,tee-driver-allow` (decompile diff + pin re-derivation: `t3-tools/verify-dtb.py` PASS).
+
+### Expected PASS lines (all stages)
+
+K; (kernel / PID1):
+- `tee session-guard: ON, 2 allowed UUID(s)` and the two `allow 0705050100...20` / `allow 0805050000...00` lines (as T2j)
+- `tee session-guard: samsung,tee-trustlet-allow pin uuid=<KM ffffffff00000000000000000000003e | GK 08130000000000000000000000000000> sha256=<40dbc984...211ea7 | 5062a6b0...7c3f57>`
+- a2: three `samsung,tee-driver-allow pin uuid=ffffffff000000000000000000000001 / ffffffffd0000000000000000000000a / ffffffffd00000000000000000000016 ...` lines; b1: the d..16 line only
+- `tee session-guard: blob pins trustlet=1 driver=<0|3|1>`
+- `T2 PASS TEE present; UFS guard DT and host binding verified`, `T2 PASS EFS RAM copy ro,noload ...`
+- `T2 copied /rom/dev/crownlte/tee-t3-run (... sha256 <per stage, see report>)`, `T2 copied /rom/dev/crownlte/t3-client (... bytes, sha256 41a08643... km | b8aee112... gk)`
+- `masked dir /rom/dev/bsg`
+- a2: three `tee session-guard: admin-load-driver uuid=<01|0a|16> type=1 len=<16013|377173|23697> sha256=... by mcDriverDaemon[N]: allowed`; b1: one (d..16, len 23697)
+- `tee session-guard: open-trustlet uuid=<KM|GK> type=3 len=<767845|10741> sha256=<pin> by crownlte-t3-<km|gk>[N]: allowed`
+- No `REFUSED (...)` line for open-trustlet / admin-load-*. Any `open-session ... REFUSED` is reported (as in T2), not fatal.
+
+P; (all prefixed `T3 `):
+- `T3 stage <s> start; software keymaster/HAL masks retained container-wide`
+- `T3 container /dev/block: sd* nodes=0 by-name dirs=0; /dev/bsg entries=0; /dev/sg* nodes=0`
+- `T3 STAGE <s>: <what>`; `T3 kernel guard on, trustlet_pins=1 driver_pins=<0|3|1>`; `T3 DT pins exact: ...`
+- `T3 verified /vendor/app/mcRegistry/<blob> bytes=... sha256=<pin>` (+ daemon, t3-client)
+- `T3 PASS pre-flight stage=<s> (guard, DT pins, blob hashes, masks, no bsg/sg)`
+- `T3 daemon start ...`, `T3 daemon exec uid=1000 preloads=<0|3|1> load_driver=<refused|allowed (kernel pins)>` (+ `T3 daemon -r <path>` lines)
+- `T3 logcat ... TEE is ready ...`; `T3 daemon ready=1 driver_loads_allowed=<n> (want <n>) blob_refusals=0 session_refusals=<n>`
+- `T3 vendor.sys.mobicoredaemon.enable=true (set by daemon)` or the runner line `... (set by runner)`
+- `T3 user node M:m private to this namespace`; `T3 verified /vendor/lib64/...` (4 libs for KM, libMcClient for GK)
+- `T3 client exec /vendor/bin/crownlte-t3-<km|gk> <s> uid=1000 groups=drmrpc seccomp=client(88 insns)`
+- KM (a*): `T3 km client start stage=a<n> uid=1000 gid=1000`, `T3 km module id=keystore name=Keymaster MDFPP Mobicore HAL ...`,
+  `T3 tee mcOpenDevice id=0 rc=0x0`, `T3 tee mcOpenTrustlet spid=0xfffffffe len=767845 tci_len=16 rc=0x0 sid=<n>`, `T3 tee mcMap ... rc=0x0` (x2),
+  `T3 km open rc=0 dev=yes trustlet_opens=1`;
+  a2: `T3 km props ... -> os_version=160000 patchlevel=202608` (before any TEE call), `T3 tee mcNotify sid=<n> cmd=0x...`,
+  `T3 tee mcWaitNotification ... rc=0x0 ...`, `T3 km configure os_version=160000 patchlevel=202608 rc=0`;
+  a1/a2: `T3 km add_rng_entropy len=32 rc=0`;
+  `T3 tee mcUnmap ... rc=0x0`, `T3 tee mcCloseSession sid=<n> rc=0x0`, `T3 tee mcCloseDevice id=0 rc=0x0`, `T3 km close rc=0`,
+  `T3 PASS km stage=a<n> tee_calls=<n> trustlet_opens=1`
+- GK b0: `T3 gk client start stage=b0 ...`, `T3 tee mcOpenDevice id=0 rc=0x0`, `T3 tee mcOpenTrustlet spid=0xfffffffd len=10741 tci_len=80 rc=0x0 sid=<n>`,
+  `T3 gk open rc=0`, `T3 tee mcCloseSession ... rc=0x0`, `T3 gk close rc=0x0`, `T3 tee mcCloseDevice id=0 rc=0x0`, `T3 PASS gk stage=b0`
+- GK b1 additionally: `T3 STAGE b1: the client sends ONE gatekeeper VERIFY command (fake uid 0x7ffffff0)`,
+  `T3 tee mcMap ... len=4096 rc=0x0`, `T3 STAGE b1: sending ONE gatekeeper VERIFY (cmd 2) ...`, `T3 tee mcNotify ... cmd=0x2 rc=0x0`,
+  `T3 tee mcWaitNotification ... timeout=15000 rc=0x0`, **`T3 gk verify uid=0x7ffffff0 notify_rc=0x0 wait_rc=0x0 ta_ret=0x<n> retry_timeout=<n> reenroll=<n> token_len=<n>`**
+  (the T4 answer: ta_ret != 0 is EXPECTED without SRPMB), `T3 tee mcUnmap ...`, `T3 PASS gk stage=b1 (verify round trip completed; see ta_ret)`
+- `T3 client exit status=0 bounded=0`; `T3 trace client writes to /efs or registry: 0`;
+  `T3 trace client successful write-opens: <n>` (only the runner's own tmpfs files `/dev/crownlte/t3-cns/empty`, `/vendor/bin/crownlte-t3-*` are expected);
+  `T3 trace client property_service connects: 0`
+- `T3 daemon exit signal=9 bounded=2 (stopped by runner)`, `T3 daemon supervisor status=125` (normal: the runner stops it)
+- `T3 summary stage=<s> client_status=0 client_pass=1 trustlet_opens_allowed=<n, at least 1> blob_refusals=0 session_refusals=<n> efs_writes=0`
+- **`T3 RESULT stage=<s> PASS`**
+
+Not PASS: any `T3 FAIL ...`, `T3 RESULT ... FAIL`, a `REFUSED (...)` blob line, a client killed by signal
+(seccomp kill = SIGSYS), `bounded=1`, a `T3 km ... rc=<non-zero>`, or any write to /efs.
+
+### Expected failure lines and meaning
+- `T3 FAIL pin counts ...` / `DT ... does not match stage` / `kernel has no blob guard`: wrong DTB/Image for this ramdisk. Nothing started.
+- `T3 FAIL km property mismatch ...` (a2): the container properties are not 16 / 2026-08-01. No TEE call made.
+- `T3 FAIL km dlopen ...` / `T3 FAIL dlopen libMcClient.so` / client exit 127: vendor linker namespace or the custom bionic start-up did not work (untested on hardware). No TEE call made.
+- `[WRN]Property vendor.sys.mobicoredaemon.enable is different...` (logcat) + `T3 km open rc=-...`: property not visible to the HAL.
+- `open-trustlet ... REFUSED (sha256 mismatch|uuid not pinned|service type)`: the kernel guard refused a blob (vendor image changed or wrong DTB).
+- a0/a1: TIMA/CryptoManager errors in TA logs are expected without drivers. a1 `add_rng_entropy rc=-<n>` may mean the TA wants configure first (then a2 answers it).
+- b1: `wait_rc=0x...` timeout (15 s): SWd busy (SRPMB retry); the client closes and exits, the runner kills; a reboot clears SWd state.
+
+### Abort / return path
+Unchanged from T2: the independent 600 s PID1 deadline restart, serial capture, restore image 8763860c. Nothing in
+T3 writes persistent storage from the NWd: /efs is a RO RAM copy (hidden from the clients), registries are tmpfs,
+no RPMB path exists (ufs-srpmb not ported, /dev/bsg RO-masked, no /dev/sg*, UFS SCSI write guard).

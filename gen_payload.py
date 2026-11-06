@@ -27,6 +27,11 @@ DEADLINE = os.environ.get('DEADLINE', '300')
 TEE_T2 = os.environ.get('TEE_T2', '0') == '1'
 if TEE_T2 and DEADLINE != '600':
     raise SystemExit('TEE_T2 requires DEADLINE=600')
+# TEE_T3=<stage>: T3 keymaster/gatekeeper TA stages on top of TEE_T2
+# (tee-t3-design.md). a0/a1/a2 keymaster, b0/b1 gatekeeper; b1 sends one verify.
+TEE_T3 = os.environ.get('TEE_T3', '')
+if TEE_T3 and (TEE_T3 not in ('a0', 'a1', 'a2', 'b0', 'b1') or not TEE_T2):
+    raise SystemExit('TEE_T3 must be a0|a1|a2|b0|b1 and requires TEE_T2=1')
 SHOWCASE = os.environ.get('SHOWCASE', '0') == '1'
 
 PARTS = [('SYSTEM', '/', 'SYSTEM.img'), ('VENDOR', '/vendor', 'VENDOR.img'), ('ODM', '/odm', 'ODM.img')]
@@ -341,7 +346,27 @@ def main():
     (pay / 'manifest.txt').write_bytes(manifest)
     for t in ('init.diag.rc', 'probe.sh', 'init_user0.sh'):
         (pay / t).write_bytes((TEMPLATES / t).read_bytes())
-    if TEE_T2:
+    if TEE_T2 and TEE_T3:
+        # The keymaster/gatekeeper HAL masks (EMPTY) stay container-wide; only the
+        # T3 client's private namespace sees the real libraries.
+        (pay / 'tee_t2').write_text('1\n')
+        (pay / 'tee_t3').write_text(TEE_T3 + '\n')
+        (pay / 'tee-t3.sh').write_bytes((TEMPLATES / 'tee-t3.sh').read_bytes())
+        with (pay / 'init.diag.rc').open('a') as f:
+            f.write('''
+# T3 stage %s: original mobicore.rc stays empty; the T3 runner starts the daemon
+# (this stage's pinned -r preloads only) and the dedicated test client.
+on post-fs-data
+    start crownlte_tee_t3
+
+service crownlte_tee_t3 /system/bin/sh /dev/crownlte/tee-t3.sh
+    user root
+    group root system log readproc
+    seclabel u:r:su:s0
+    disabled
+    oneshot
+''' % TEE_T3)
+    elif TEE_T2:
         (pay / 'tee_t2').write_text('1\n')
         (pay / 'tee-t2.sh').write_bytes((TEMPLATES / 'tee-t2.sh').read_bytes())
         with (pay / 'init.diag.rc').open('a') as f:

@@ -1027,8 +1027,22 @@ static int romram_child(void *unused)
         /* Keep the legacy helper referenced, but never call it in T2. */
         (void)&rr_frp_setup;
         RR_DO("tee-t2-efs-copy", rr_t2_efs(nblk));
+#ifdef RR_TEE_T3
+        /* T3: stage script, stage name, runner and the one stage client (hashed copies). */
+        RR_DO("tee-t3-script", rr_copy(RR_PAYLOAD "/tee-t3.sh", RR_ROOT "/dev/crownlte/tee-t3.sh", 0755));
+        RR_DO("tee-t3-stage", rr_copy(RR_PAYLOAD "/tee_t3", RR_ROOT "/dev/crownlte/tee_t3", 0444));
+        RR_DO("tee-t3-runner", rr_t2_copy_bin(RR_PAYLOAD "/tee-t3-run", RR_ROOT "/dev/crownlte/tee-t3-run", 0755));
+        RR_DO("tee-t3-client", rr_t2_copy_bin(RR_PAYLOAD "/t3-client", RR_ROOT "/dev/crownlte/t3-client", 0755));
+        /* No SCSI pass-through (RPMB W-LU) nodes: /dev/bsg is a read-only empty
+         * tmpfs before ueventd starts (the sysfs bsg/scsi_generic masks already
+         * hide the devices; this also blocks node creation). tee-t3.sh and the
+         * runner re-check /dev/bsg and /dev/sg*. */
+        RR_DO("tee-t3-bsg-dir", rr_mkdirs(RR_ROOT "/dev/bsg", 0755));
+        RR_DO("tee-t3-bsg-mask", rr_mask_dir(RR_ROOT "/dev/bsg"));
+#else
         RR_DO("tee-t2-script", rr_copy(RR_PAYLOAD "/tee-t2.sh", RR_ROOT "/dev/crownlte/tee-t2.sh", 0755));
         RR_DO("tee-t2-runner", rr_t2_copy_bin(RR_PAYLOAD "/tee-t2-run", RR_ROOT "/dev/crownlte/tee-t2-run", 0755));
+#endif
         /* A read-only regular-file mount permanently occupies the user-session node. */
         RR_DO("tee-t2-no-clients", rr_write(RR_ROOT "/dev/mobicore-user", "", 0, 0000));
         RR_DO("tee-t2-no-clients-mask", rr_mask_file(RR_ROOT "/dev/mobicore-user"));
