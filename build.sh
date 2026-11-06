@@ -1,5 +1,5 @@
 #!/bin/bash
-# crownlte ROM-in-RAM diagnostic ramdisk build (gekko, /mnt/ssd only).
+# crownlte ROM-in-RAM diagnostic ramdisk build (gekko; scratch in /dev/shm).
 # Usage: build.sh <build-dir>   (build-dir must not exist)
 set -euo pipefail
 SRC=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -26,6 +26,7 @@ exec > >(tee build.log) 2>&1
 } > romram-sha256.h
 cp "$SRC"/init.c "$SRC"/romram.h "$SRC"/romram-host-test.c "$SRC"/gen_payload.py .
 cp -r "$SRC"/templates .
+if [ "${TEE_T2:-0}" = 1 ]; then cp "$SRC"/tee-t2-run.c .; fi
 
 # 1. Composite read-only root from the partition backups (as the phone mounts them).
 if ! mountpoint -q "$TR"; then
@@ -56,7 +57,12 @@ EOF
 cat host-test.log | grep -v '^  log:'
 
 # 4. Static PID1.
-aarch64-linux-gnu-gcc -static -std=gnu11 -Os -Wall -Wextra -Werror -Wno-format-truncation init.c -o init
+T2_CFLAGS=()
+if [ "${TEE_T2:-0}" = 1 ]; then
+  test "${DEADLINE:-600}" = 600
+  T2_CFLAGS=(-DRR_TEE_T2)
+fi
+aarch64-linux-gnu-gcc "${T2_CFLAGS[@]}" -static -std=gnu11 -Os -Wall -Wextra -Werror -Wno-format-truncation init.c -o init
 aarch64-linux-gnu-readelf -h -l init > init-readelf.txt
 if grep -q INTERP init-readelf.txt; then echo "init is dynamic"; exit 1; fi
 
@@ -64,6 +70,10 @@ if grep -q INTERP init-readelf.txt; then echo "init is dynamic"; exit 1; fi
 mkdir rootfs
 cp init rootfs/init; chmod 0755 rootfs/init
 cp -r payload/crownlte rootfs/crownlte
+if [ "${TEE_T2:-0}" = 1 ]; then
+  aarch64-linux-gnu-gcc -static -Os -Wall -Wextra -Werror tee-t2-run.c -o tee-t2-run
+  cp tee-t2-run rootfs/crownlte/tee-t2-run
+fi
 chmod 0644 rootfs/crownlte/* rootfs/crownlte/sanitized/*
 chmod 0755 rootfs/crownlte/probe.sh rootfs/crownlte/init_user0.sh rootfs/crownlte rootfs/crownlte/sanitized
 chmod 0444 rootfs/crownlte/empty

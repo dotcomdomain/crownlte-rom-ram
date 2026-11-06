@@ -764,3 +764,40 @@ powershell -ExecutionPolicy Bypass -File C:\Users\Patrick\tools\trial-romram-202
 ## Abort / return path
 Unchanged: container SIGKILL at 575 s, restart at 600 s, watchdog/panic fallbacks, then restore bright RECOVERY
 (8763860c).
+
+## TEE T2 (build-only, 2026-11-06)
+
+Opt in with `TEE_T2=1 DEADLINE=600 ./build.sh /dev/shm/<fresh-build-dir>`.
+Without TEE_T2 the original ramdisk is byte-identical at the same deadline;
+TEE refusal remains. Final artifacts: `rom-ram/build-11` and
+`rom-ram/pack-romram-tee-t2/recovery.img`. See `src/TEE-T2-REPORT.md`.
+
+This is the restricted daemon-only T2 stage: **no vendor -r preloads** and no
+secure driver/TA loads (seccomp denies MobiCore LOAD_DRIVER/LOAD_CHECK).
+It tests daemon/admin-device startup and auth-token reads, not vendor driver
+initialization or keymaster. All other TEE clients remain masked. No T3.
+
+For a separately authorized hardware trial, use the existing ROM-RAM serial
+capture procedure and its exact READY -> PROBE -> START frames; keep capture
+through the independent 600 s deadline restart. No phone action was performed
+when preparing this pack. Do not substitute older ramdisks or enable TA clients.
+The fallback T1 kernel lacks panel L2 recovery; use serial evidence.
+
+Expected evidence, not hardware results:
+- K; `T2 PASS TEE present; UFS guard DT and host binding verified`
+- K; `T2 PASS EFS RAM copy ro,noload bytes=... sha256=...`
+- K; `T2 PASS forbidden blocks hidden; FRP real partition never opened`
+- P; `T2 PASS userspace audit ready; software keymaster masks retained`
+- P; `T2 daemon start ... uid=1000 no-preload`, followed by strace evidence
+  of successful `/dev/mobicore` open; no successful user-session device opens.
+- P; registry before/poll/after, failed writes including EROFS/EACCES/EPERM,
+  passive session/counter snapshots if debugfs files exist, McDaemon logcat.
+- P; `T2 daemon exit status=...` or signal, then supervisor status. Nonzero
+  exit, failed exec, trace failure or absent successful admin open is NOT PASS.
+- K; the independent timer restart at 600 s. The T1 selftest may no longer
+  say PASS after a daemon creates a client: its zero-client invariant is T1-only.
+
+There is no exported UFS guard counter in this kernel. The audit explicitly
+reports unavailable; `diagnostic rejects SCSI opcode` on K; is a ratelimited
+lower bound, not a precise counter. Never read trustonic crashdump or active_cpu.
+Do not treat absent EFS-write errors as proof that all daemon paths executed.

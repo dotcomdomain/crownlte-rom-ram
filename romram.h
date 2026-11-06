@@ -726,6 +726,63 @@ out:
         return error;
 }
 
+
+#ifdef RR_TEE_T2
+/* Only EFS is read, once. The real device is never mounted or exposed. */
+static int rr_t2_efs(int nblk)
+{
+        const struct rr_blk *x = NULL;
+        int in = -1, out = -1, ctl = -1, loop = -1, error = -ENOENT, ro = 0;
+        char node[64], lnode[64], hash[65];
+        unsigned long long bytes = 0, hashed = 0;
+        struct stat st;
+        for (int i = 0; i < nblk; i++)
+                if (rr_blocks[i].partition && !strcmp(rr_blocks[i].partname, "EFS")) {
+                        if (x) return -EEXIST;
+                        x = &rr_blocks[i];
+                }
+        if (!x) return -ENOENT;
+        if ((error = rr_roset(x, &bytes))) return error;
+        if (!bytes || bytes > (64ULL << 20)) return -EFBIG;
+        if ((error = rr_mkdirs("/crownlte-t2", 0700))) return error;
+        if ((error = rr_mount("tmpfs", "/crownlte-t2", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0700,size=65m"))) return error;
+        snprintf(node, sizeof(node), "/dev/%s", x->name);
+        in = open(node, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (in < 0) { error = -errno; goto done; }
+        if (fstat(in, &st) || !S_ISBLK(st.st_mode) || st.st_rdev != makedev(x->major, x->minor) ||
+            ioctl(in, BLKROGET, &ro) || ro != 1) { error = -EXDEV; goto done; }
+        out = open("/crownlte-t2/efs.img", O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+        if (out < 0) { error = -errno; goto done; }
+        if ((error = rr_copy_fd(in, out, bytes))) goto done;
+        close(in); in = -1;
+        if ((error = rr_sha_at0(out, hash, &hashed))) goto done;
+        if (hashed != bytes) { error = -EIO; goto done; }
+        close(out);
+        out = open("/crownlte-t2/efs.img", O_RDONLY | O_CLOEXEC);
+        if (out < 0) { error = -errno; goto done; }
+        ctl = open("/dev/loop-control", O_RDWR | O_CLOEXEC);
+        if (ctl < 0) { error = -errno; goto done; }
+        int num = ioctl(ctl, LOOP_CTL_GET_FREE);
+        if (num < 0) { error = -errno; goto done; }
+        snprintf(lnode, sizeof(lnode), "/dev/loop%d", num);
+        for (int w = 0; w < 100 && access(lnode, F_OK); w++) usleep(10000);
+        loop = open(lnode, O_RDONLY | O_CLOEXEC);
+        if (loop < 0) { error = -errno; goto done; }
+        struct loop_config cfg = {0};
+        cfg.fd = out; cfg.info.lo_flags = LO_FLAGS_READ_ONLY;
+        if (ioctl(loop, LOOP_CONFIGURE, &cfg)) { error = -errno; goto done; }
+        error = rr_mount(lnode, RR_ROOT "/efs", "ext4", MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, "noload");
+        if (!error) error = rr_ro_mounted(RR_ROOT "/efs");
+        if (!error) rr_log("T2 PASS EFS RAM copy ro,noload bytes=%llu sha256=%s", bytes, hash);
+done:
+        if (in >= 0) close(in);
+        if (out >= 0) close(out);
+        if (loop >= 0) close(loop);
+        if (ctl >= 0) close(ctl);
+        return error;
+}
+#endif
+
 static int romram_child(void *unused)
 {
         char path[RR_PATH * 2], real[PATH_MAX], cmdline[4096], extra[2048];
@@ -756,6 +813,20 @@ static int romram_child(void *unused)
                 rr_log("UFS host bound with crownlte,read-only-diagnostic (SCSI write guard armed)");
         }
 
+#ifdef RR_TEE_T2
+        {
+                char status[16]; struct stat st;
+                stage = "tee-t2-required";
+                if (access(RR_PAYLOAD "/tee_t2", R_OK) ||
+                    rr_text("/sys/firmware/devicetree/base/tee/status", status, sizeof(status)) < 0 ||
+                    (strcmp(status, "okay") && strcmp(status, "ok")) ||
+                    stat("/dev/mobicore", &st) || !S_ISCHR(st.st_mode) ||
+                    access("/sys/bus/platform/drivers/mcd/tee", F_OK)) {
+                        error = -ENODEV; goto out;
+                }
+                rr_log("T2 PASS TEE present; UFS guard DT and host binding verified");
+        }
+#else
         /*
          * 1b. Never run Lineage against a live Trustonic TEE: mcDriverDaemon +
          * keymaster could upgrade or rewrap keys (irreversible for 4.9). Refuse
@@ -796,6 +867,8 @@ static int romram_child(void *unused)
                 rr_log("Trustonic TEE absent (no /dev/mobicore*, DT /tee not okay)");
         }
 
+#endif
+
         /* 2. Wait (bounded) for the three partitions, then read-only every sd*. */
         stage = "wait-partitions";
         for (int attempt = 0;; attempt++) {
@@ -829,6 +902,10 @@ static int romram_child(void *unused)
         stage = "blkroset";
         for (int i = 0; i < nblk; i++) {
                 unsigned long long bytes = 0;
+#ifdef RR_TEE_T2
+                /* Never open whole disks or forbidden partitions, even for an ioctl. */
+                if (i != idx[0] && i != idx[1] && i != idx[2]) continue;
+#endif
                 error = rr_roset(&rr_blocks[i], &bytes);
                 if (error) {
                         rr_log("BLKROSET %s failed errno=%d", rr_blocks[i].name, -error);
@@ -842,7 +919,11 @@ static int romram_child(void *unused)
                                 goto out;
                         }
         }
+#ifdef RR_TEE_T2
+        rr_log("T2 BLKROSET=1 verified on SYSTEM/VENDOR/ODM only; EFS checked separately");
+#else
         rr_log("BLKROSET=1 verified on all %d sd* nodes", nblk);
+#endif
 
         /* 3. Read-only mounts. ext4 "noload": never replay a journal. */
         RR_DO("mkdir-rom", mkdir(RR_ROOT, 0755) && errno != EEXIST ? -errno : 0);
@@ -901,7 +982,20 @@ static int romram_child(void *unused)
                 }
         }
         /* 5a-frp. Real FRP block as a verified RAM copy (non-fatal, see rr_frp_setup). */
+#ifdef RR_TEE_T2
+        /* Keep the legacy helper referenced, but never call it in T2. */
+        (void)&rr_frp_setup;
+        RR_DO("tee-t2-efs-copy", rr_t2_efs(nblk));
+        RR_DO("tee-t2-script", rr_copy(RR_PAYLOAD "/tee-t2.sh", RR_ROOT "/dev/crownlte/tee-t2.sh", 0755));
+        RR_DO("tee-t2-runner", rr_copy(RR_PAYLOAD "/tee-t2-run", RR_ROOT "/dev/crownlte/tee-t2-run", 0755));
+        /* A read-only regular-file mount permanently occupies the user-session node. */
+        RR_DO("tee-t2-no-clients", rr_write(RR_ROOT "/dev/mobicore-user", "", 0, 0000));
+        RR_DO("tee-t2-no-clients-mask", rr_mask_file(RR_ROOT "/dev/mobicore-user"));
+        RR_DO("tee-t2-block-dir", rr_mkdirs(RR_ROOT "/dev/block", 0755));
+        RR_DO("tee-t2-block-mask", rr_mask_dir(RR_ROOT "/dev/block"));
+#else
         (void)rr_frp_setup(nblk);
+#endif
         RR_DO("payload-rc", rr_copy(RR_PAYLOAD "/init.diag.rc", RR_ROOT "/dev/crownlte/init.diag.rc", 0644));
         RR_DO("payload-probe", rr_copy(RR_PAYLOAD "/probe.sh", RR_ROOT "/dev/crownlte/probe.sh", 0755));
         RR_DO("payload-user0", rr_copy(RR_PAYLOAD "/init_user0.sh", RR_ROOT "/dev/crownlte/init_user0.sh", 0755));
@@ -964,6 +1058,13 @@ static int romram_child(void *unused)
         RR_DO("second_stage_resources", rr_mount("tmpfs", RR_ROOT "/second_stage_resources", "tmpfs", MS_NOEXEC | MS_NOSUID | MS_NODEV, "mode=0755,uid=0,gid=0"));
         RR_DO("data", rr_mount("tmpfs", RR_ROOT "/data", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0771,uid=1000,gid=1000,size=1536m"));
         RR_DO("cache", rr_mount("tmpfs", RR_ROOT "/cache", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0770,uid=1000,gid=2001,size=64m"));
+
+#ifdef RR_TEE_T2
+        RR_DO("tee-t2-efs-alias", rr_mkdirs(RR_ROOT "/mnt/vendor/efs", 0755));
+        RR_DO("tee-t2-efs-bind", rr_bind_ro(RR_ROOT "/efs", RR_ROOT "/mnt/vendor/efs"));
+        /* /data, including both registry layouts and TbStorage, is already tmpfs. */
+        rr_log("T2 PASS forbidden blocks hidden; FRP real partition never opened");
+#endif
 
         /* 6. Switch root and exec Lineage init's selinux_setup. */
         RR_DO("chdir-rom", chdir(RR_ROOT) ? -errno : 0);
