@@ -47,6 +47,7 @@ for n in $(seq 1 95); do
     kill -0 "$runner" 2>/dev/null || break
 done
 wait "$runner"
+sup_status=$?
 # Whole-trace totals (never truncated): write-type syscalls on protected paths and refusals.
 if [ -r /dev/crownlte/tee-t2.strace ]; then
     echo "T2 trace totals: lines=$(wc -l < /dev/crownlte/tee-t2.strace)"
@@ -54,5 +55,5 @@ if [ -r /dev/crownlte/tee-t2.strace ]; then
     echo "T2 trace EROFS=$(grep -c EROFS /dev/crownlte/tee-t2.strace) EACCES=$(grep -c EACCES /dev/crownlte/tee-t2.strace) EPERM=$(grep -c EPERM /dev/crownlte/tee-t2.strace)"
     grep -E '^[0-9]+ +(write|pwrite64|writev|fsync)\([0-9]+<[^>]*(/efs|mcRegistry|TbStorage)' /dev/crownlte/tee-t2.strace | head -40
 fi
-echo "T2 supervisor exit status=$?"
+echo "T2 supervisor exit status=$sup_status"
 snapshot after
