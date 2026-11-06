@@ -22,6 +22,9 @@ ROOT = Path(sys.argv[1])
 OUT = Path(sys.argv[2])
 TEMPLATES = Path(__file__).resolve().parent / 'templates'
 DEADLINE = os.environ.get('DEADLINE', '300')
+# SHOWCASE=1: probe.sh marks setup complete (RAM /data only) and opens Settings
+# About phone, then the Android version page, for photos of the running build.
+SHOWCASE = os.environ.get('SHOWCASE', '0') == '1'
 
 PARTS = [('SYSTEM', '/', 'SYSTEM.img'), ('VENDOR', '/vendor', 'VENDOR.img'), ('ODM', '/odm', 'ODM.img')]
 BACKUPS = Path('/mnt/ssd/host-builds/kernel-upgrade/backups-20261103/partitions')
@@ -332,13 +335,13 @@ def main():
     (pay / 'manifest.txt').write_bytes(manifest)
     for t in ('init.diag.rc', 'probe.sh', 'init_user0.sh'):
         (pay / t).write_bytes((TEMPLATES / t).read_bytes())
-    (pay / 'cmdline-extra').write_text(CMDLINE_EXTRA + '\n')
+    (pay / 'cmdline-extra').write_text(CMDLINE_EXTRA + (' androidboot.crownlte_showcase=1' if SHOWCASE else '') + '\n')
     (pay / 'deadline_seconds').write_text(DEADLINE + '\n')
     (pay / 'bypass_enabled').write_text('1\n')
     (pay / 'empty').write_bytes(b'')
     (pay / 'payload-id').write_text(
         f'crownlte-rom-ram payload; manifest sha256 {sha(manifest)}; deadline {DEADLINE}s; '
-        f'bypass enabled; rc replacements {sorted(repls)}; empties {sorted(EMPTY)}\n')
+        f'bypass enabled; showcase {int(SHOWCASE)}; rc replacements {sorted(repls)}; empties {sorted(EMPTY)}\n')
     (OUT / 'sanitize-report.txt').write_text('\n'.join(report) + '\n')
     n = sum(1 for l in lines if l[:1] in 'FLDA')
     print(f'manifest entries={n} replacements={len(repls)} empties={len(EMPTY)} sha={sha(manifest)}')

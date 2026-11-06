@@ -9,6 +9,29 @@ echo "CROWNLTE-PROBE start uptime=$(cat /proc/uptime)"
 bypass=0
 [ -e /dev/crownlte/bypass_enabled ] && bypass=1
 echo "CROWNLTE-PROBE bypass_enabled=$bypass"
+# Showcase (only with androidboot.crownlte_showcase=1): once booted, mark
+# setup complete in the RAM /data and open About phone, then the Android
+# version page (LineageOS version, kernel), for photos of the running build.
+if [ "$(getprop ro.boot.crownlte_showcase)" = 1 ]; then
+  (
+    while [ "$(getprop sys.boot_completed)" != 1 ]; do sleep 2; done
+    sleep 15
+    echo "CROWNLTE-SHOWCASE start uptime=$(cut -d' ' -f1 /proc/uptime)"
+    settings put global device_provisioned 1
+    settings put secure user_setup_complete 1
+    pm disable-user --user 0 org.lineageos.setupwizard
+    settings put system screen_off_timeout 1800000
+    svc power stayon true
+    input keyevent KEYCODE_WAKEUP
+    wm dismiss-keyguard
+    sleep 3
+    am start -W -a android.settings.DEVICE_INFO_SETTINGS
+    echo "CROWNLTE-SHOWCASE about-phone uptime=$(cut -d' ' -f1 /proc/uptime)"
+    sleep 120
+    am start -W -n 'com.android.settings/.Settings$FirmwareVersionActivity'
+    echo "CROWNLTE-SHOWCASE android-version uptime=$(cut -d' ' -f1 /proc/uptime)"
+  ) &
+fi
 ks=0; okd=0; ovd=0; n=0
 while true; do
   up=$(cut -d' ' -f1 /proc/uptime)
