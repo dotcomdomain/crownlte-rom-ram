@@ -3,8 +3,13 @@
 exec >>/dev/crownlte/probe.txt 2>&1
 echo 'T2 audit start; polling + strace (failed attempts included; write buffers raw)'
 # Storage nodes must be invisible in the container (sysfs masks); refuse otherwise.
-sd=$(ls -R /dev/block 2>/dev/null | grep -c '^sd')
-byname=$(ls -R /dev/block 2>/dev/null | grep -c '^by-name')
+if ! ls -1R /dev/block > /dev/crownlte/t2-devblock.txt 2>&1; then
+    head -20 /dev/crownlte/t2-devblock.txt
+    echo 'T2 FAIL cannot list container /dev/block; daemon NOT started'
+    exit 125
+fi
+sd=$(grep -c '^sd' /dev/crownlte/t2-devblock.txt)
+byname=$(grep -c '^by-name' /dev/crownlte/t2-devblock.txt)
 echo "T2 container /dev/block: sd* nodes=$sd by-name dirs=$byname"
 if [ "$sd" != 0 ] || [ "$byname" != 0 ]; then
     ls -lR /dev/block 2>&1 | head -60
