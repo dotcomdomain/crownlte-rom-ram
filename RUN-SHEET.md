@@ -801,3 +801,123 @@ There is no exported UFS guard counter in this kernel. The audit explicitly
 reports unavailable; `diagnostic rejects SCSI opcode` on K; is a ratelimited
 lower bound, not a precise counter. Never read trustonic crashdump or active_cpu.
 Do not treat absent EFS-write errors as proof that all daemon paths executed.
+
+## ADB over USB NCM (ADB=1, build-only, 2026-11-06)
+
+Branch `romram-adb` 899632d on tee-t2 3259275. Opt-in: `ADB=1 ADB_PUBKEY=<adbkey.pub> ./build.sh <fresh dir>`
+(`ADB_ROOT=1` additionally, for `adb root`). Without ADB the ramdisk is byte-identical to tee-t2
+(72195507..., checked). TEE_T2 paths are unchanged. ADB together with TEE_T2 compiles but was not
+built or run.
+
+| artifact | sha256 |
+|---|---|
+| host public key `rom-ram/adb-host-key/adbkey.pub` (derived offline with `adb pubkey` from the Windows PC key; the private key never left the PC) | c1082a43... (file); installed line 9b66ffa1... |
+| ramdisk ADB=1 `rom-ram/build-18` | 4fe8d2d1afc693fb2be4008714b86db1c2a7da197572c495a80a216a68f6620e |
+| ramdisk ADB=1 ADB_ROOT=1 `rom-ram/build-19` | fd11f8fe97f61ec660ef536725a69696c41edd2d1db1e8e5008574b0664909c9 |
+| kernel Image (same as T2i, crownlte-tee-3 566ee45af), `panel-bright-work/ko-adb1` (hard link) | dabc09eba0254e1ff90ab6e369f294994a4a43534f4328c1bb72ba19f068d84e |
+| DTB `exynos9810-crownlte-romram-adb1-teeoff.dtb` = T2i tee-t3fsd2 (ca9545b4) with `tee/status = "disabled"` and a new model string only (dtc round-trip of ca9545b4 is byte-exact; diff in `panel-bright-work/dtb/...adb1-teeoff.dts.diff`) | 052c23f3a5c503f717d593002e390a9295a28b84ce44ca3b7294a1a6a579f2da |
+| `rom-ram/pack-romram-adb1/recovery.img` (ADB=1) | b696c32c34e5524012d7869b25fee08a8fdb5f2acd593838dbce026dfaaf5bde |
+| `rom-ram/pack-romram-adb1-root/recovery.img` (ADB=1 ADB_ROOT=1) | f37517066d85082db442d9fe1c6915d1f20099660ec7ffa777c8756fd7309e9a |
+| shim bbea9590, parent a8198be0, restore 8763860c (as T2i) | |
+
+Why not the T2i DTB unchanged: it has `tee { status = "okay" }`. Without TEE_T2 the ROM stage
+refuses a live TEE (`ROM stage STOPPED stage=tee-must-be-off`), so Lineage and adbd would never start.
+
+### Design
+- PID1's gadget `crownlte_diag` (VID/PID 1d6b:0104 unchanged) gets `ncm.usb0` linked **after**
+  `acm.usb0`: ACM stays interfaces 0/1 (ttyGS0, same frames), NCM is 2/3. Device class EF/02/01 (IAD
+  composite), so Windows loads usbccgp and binds the in-box usbser (ACM) and UsbNcm
+  (`USB\Class_02&SubClass_0d&Prot_00`, in `C:\Windows\INF\usbncm.inf` on the test PC). New serial
+  `crownlte-romram-adb`, so Windows makes a fresh device node. **The COM number will probably not be 4.**
+  `romram-capture.ps1` now finds the present 1d6b:0104 port (prefers MI_00), falls back to COM4, and
+  prints `port COMn`. `-Port COMn` forces a port. The old copy is `romram-capture.ps1.pre-adb`.
+- Netdev `crownadb0` (no tethering/ethernet regex matches it). Phone MAC 02:43:52:4e:39:44, Windows
+  adapter MAC 02-43-52-4E-39-48. NCM can never block the log port. On any NCM setup error, or after two
+  UDC bind failures with NCM linked, PID1 drops NCM and binds ACM-only (`ADB NCM dropped ...`).
+- Container `/dev/crownlte/adb.sh`, started at post-fs-data as root/su:
+  - Installs the public key line into RAM `/data/misc/adb/adb_keys` (system:shell 0640,
+    `restorecon` gives adb_keys_file).
+  - Sets crownadb0 up with `fe80::1/64` (nodad) and `169.254.42.1/16`. No DHCP, router or DNS is
+    offered, so Windows routing and DNS are untouched.
+  - Adds `169.254.0.0/16` and `fe80::/64 dev crownadb0` to netd's `local_network` table 97. netd
+    deletes the kernel's `lookup main` rule at start (AOSP RouteController::Init, read in source); its
+    rule 20000 `fwmark 0x0/0x10000 lookup local_network` serves unmarked replies. Init flushes rules,
+    not tables.
+  - Re-checks every 10 s, repairs, and reports `ADB REPAIR ...` if anything changed the link.
+  - Never touches configfs, the UDC, block devices or mounts.
+- init.diag.rc (ADB only), at post-fs-data:
+  - `service.adb.tcp.port=5555`.
+  - `persist.sys.usb.config=adb`: this build has no default, and then AdbService turns adb off.
+  - Keepalive `on property:init.svc.adbd=stopped && ro.boot.crownlte_adb=1 -> start adbd`, because
+    `sys.usb.config=none` runs `stop adbd`.
+  - Every adbd state change is logged as `crownlte-romram: ADB init.svc.adbd=...`.
+- Root: this Lineage "userdebug" build ships **`ro.debuggable=0`** (system/build.prop:89). adbd
+  checks that, so on the ADB=1 pack `adb root` answers `adbd cannot run as root in production builds`.
+  The ADB_ROOT=1 pack changes exactly that line through the verified PROP_SET overlay. Other
+  ro.debuggable=1 effects in the rc files:
+  - `start console`, which fails because there is no /dev/console.
+  - `chmod` of /data/misc/trace (RAM).
+  - The llkd variant, but llkd stays off.
+  - `clean_scratch_files` needs dynamic_partitions, which is absent here.
+
+### How to run
+1. `run-trial.sh <dir> 630 <trial dir>\romram-capture.ps1`, exactly as for T2: READY -> PROBE ->
+   START, 600 s deadline, container SIGKILL at 575 s. `<dir>` is `trial-romram-20261104\adb1` (or
+   `adb1-root`).
+2. When the reboot starts, run in a second window
+   `powershell -ExecutionPolicy Bypass -File C:\Users\Patrick\tools\trial-romram-20261104\romram-adb.ps1`
+   (add `-Root` on the adb1-root pack). It waits up to 540 s for the adapter and port, then:
+   - probes `[fe80::1%<ifIndex>]:5555`, then `169.254.42.1:5555` once Windows has an APIPA address;
+   - runs `adb connect` and uses `-s <serial>` for every command;
+   - runs `id`, `uname -a` and a few getprops.
+   It needs no admin rights and never opens a COM port. Manual fallback:
+   `adb connect [fe80::1%N]:5555`, where N is the ifIndex of the adapter with MAC 02-43-52-4E-39-48
+   (`Get-NetAdapter`).
+
+### Expected PASS lines (not yet seen on hardware)
+- Capture: `port COMn at ...`, `READY sent`, `PROBE + ROMRAM-START sent`.
+- K: `crownlte-diag: ADB NCM bound with ACM: ifname=crownadb0 dev_addr=02:43:52:4e:39:44 host_addr=02:43:52:4e:39:48 class=EF/02/01 serial=crownlte-romram-adb`.
+  This comes before `USB result stage=gadget-bound` and `serial open errno=0`.
+- K: `crownlte-romram: ADB payload: adb.sh and adb_keys (public key) copied ...` (before `exec /system/bin/init`).
+- P: `ADB start ...`, then `ADB PASS key installed: -rw-r----- 1 system shell u:object_r:adb_keys_file:s0 ... lines=1`.
+- P: `ADB PASS link crownadb0 up: crownadb0 UP 169.254.42.1/16 fe80::1/64 ...`.
+- K: `ADB init.svc.adbd=running`. Then P: `ADB PASS adbd listening on tcp 5555`.
+- Helper: `PASS tcp [fe80::1%N]:5555 answers`, `PASS adb device ...`, `id: uid=2000(shell) ...`
+  (`uid=0(root)` after `-Root` on adb1-root). Then P: `ADB PASS host connected to tcp 5555 (established=1)`.
+- P: `ADB status ...` every 30 s. Healthy is `rule20000=1`, `listen>=1`, `link=up/carrier=1`.
+  At ~70 s an `--- ADB detail` block dumps `ip rule` and table 97.
+
+### How to verify
+- In the adb shell:
+  - `getprop ro.boot.crownlte_adb` gives 1.
+  - `ip -br addr show crownadb0`, `ip rule`, `ip route show table 97`.
+  - `ls /dev/block`: no sd* nodes, same as every ROM-RAM run.
+  - `cat /proc/mounts | grep -E ' / | /data '`: ro root, tmpfs /data.
+- Serial must keep flowing (K/L/P) while adb is in use, until the 600 s restart, which must still
+  happen. Then the phone boots normally. Restore bright RECOVERY as usual.
+- Not PASS:
+  - `ADB NCM dropped` or `not in the bound gadget`.
+  - `ADB REPAIR` lines that repeat. Something keeps reconfiguring the link; note what changed.
+  - `unauthorized` in the helper: key not taken. Check `ADB PASS key installed`.
+  - Repeated `ADB init.svc.adbd=stopped/running` flips: UsbDeviceManager is toggling sys.usb.config.
+
+### Rules for the adb session
+- Root in the container is the same root the rc services already have. The UFS SCSI write guard,
+  BLKROSET, storage masks and tmpfs /data are unchanged, and they remain the backstop.
+- Still never run anything that writes storage or partitions: no `dd of=`, mkfs, `adb remount`,
+  `disable-verity`, sideload/flash, or `adb reboot <target>`. A plain `adb reboot` only ends the PID
+  namespace. Lineage is then gone until the outer restart.
+
+### Open risks (untested on hardware)
+1. Composite ACM+NCM on dwc3 and the Windows enumeration (usbccgp + usbser + UsbNcm against Linux
+   f_ncm). The fallback is ACM-only, logged. If UsbNcm fails, RNDIS (also in-box) would be the next try.
+2. The netd routing rule is read from AOSP main source, not checked on this build. If `rule20000=0`
+   or SYN-ACKs never leave, an own `ip rule` is the fix.
+3. UsbDeviceManager may toggle `sys.usb.config` none/adb. Each toggle restarts adbd, the keepalive
+   covers it, and TCP sessions drop and need `adb connect` again.
+4. adbd's dual-stack listen (libcutils socket_inaddr_any_server) is not verified. IPv4 needs the
+   Windows APIPA address (can take about a minute).
+5. Windows getaddrinfo parses `fe80::1%17` with the scope (checked on the test PC). The end-to-end
+   `adb connect` to a scoped address is untested.
+6. ADB_ROOT side effects beyond the list above. Any adb host on this USB link has key-authorized
+   access. The key is the test PC key.
