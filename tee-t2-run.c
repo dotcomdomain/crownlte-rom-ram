@@ -38,6 +38,19 @@
  * UNMAP, ERR 0xc0084d07 and all GP_* (20+). */
 #define T2_MC_USER_VERSION       0x80604d09u
 #define T2_MC_USER_HAS_SESSIONS  0x00004d08u
+/* T2 v3: session plumbing on the user node, gated by the KERNEL session guard
+ * (DT samsung,tee-session-guard, crownlte-tee-3): OPEN_SESSION 0xc0404d00 reaches
+ * the guard, which logs the UUID and refuses unless allow-listed. CLOSE, NOTIFY,
+ * WAIT, MAP, UNMAP and ERR only act on sessions/buffers the guard let through.
+ * Still refused here: OPEN_TRUSTLET 0xc0284d01 (TA from a buffer), LOAD_DRIVER,
+ * LOAD_CHECK and every GP_* (0x40084d14 ...). */
+#define T2_MC_USER_OPEN_SESSION  0xc0404d00u
+#define T2_MC_USER_CLOSE         0x00004d02u
+#define T2_MC_USER_NOTIFY        0x00004d03u
+#define T2_MC_USER_WAIT          0x400c4d04u
+#define T2_MC_USER_MAP           0xc0284d05u
+#define T2_MC_USER_UNMAP         0x40284d06u
+#define T2_MC_USER_ERR           0xc0084d07u
 static int restrict_tee(void)
 {
     struct sock_filter code[] = {
@@ -45,14 +58,21 @@ static int restrict_tee(void)
         BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, AUDIT_ARCH_AARCH64, 1, 0),
         BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_KILL_PROCESS),
         BPF_STMT(BPF_LD+BPF_W+BPF_ABS, offsetof(struct seccomp_data, nr)),
-        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, __NR_ioctl, 0, 8),
+        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, __NR_ioctl, 0, 15),
         /* ioctl cmd is an unsigned int: the low 32 bits of args[1] (LE). */
         BPF_STMT(BPF_LD+BPF_W+BPF_ABS, offsetof(struct seccomp_data, args[1])),
-        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, T2_MC_GET_DRIVER_REQUEST, 6, 0),
-        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, T2_MC_GET_INFO, 5, 0),
-        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, T2_MC_LOAD_TOKEN, 4, 0),
-        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, T2_MC_USER_VERSION, 3, 0),
-        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, T2_MC_USER_HAS_SESSIONS, 2, 0),
+        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, T2_MC_GET_DRIVER_REQUEST, 13, 0),
+        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, T2_MC_GET_INFO, 12, 0),
+        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, T2_MC_LOAD_TOKEN, 11, 0),
+        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, T2_MC_USER_VERSION, 10, 0),
+        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, T2_MC_USER_HAS_SESSIONS, 9, 0),
+        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, T2_MC_USER_OPEN_SESSION, 8, 0),
+        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, T2_MC_USER_CLOSE, 7, 0),
+        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, T2_MC_USER_NOTIFY, 6, 0),
+        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, T2_MC_USER_WAIT, 5, 0),
+        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, T2_MC_USER_MAP, 4, 0),
+        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, T2_MC_USER_UNMAP, 3, 0),
+        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, T2_MC_USER_ERR, 2, 0),
         /* Every other 'M' ioctl (LOAD_DRIVER, LOAD_CHECK, OPEN_SESSION,
          * OPEN_TRUSTLET, ...) is refused, whatever its size/direction bits. */
         BPF_STMT(BPF_ALU+BPF_AND+BPF_K, 0xff00),
@@ -80,6 +100,15 @@ static int t2_read_devt(const char *path, unsigned *ma, unsigned *mi)
 }
 static int private_user_node(void)
 {
+    char g[4] = {0};
+    int gfd = open("/sys/module/mcDrvModule/parameters/session_guard", O_RDONLY | O_CLOEXEC);
+    if (gfd < 0 || read(gfd, g, sizeof(g) - 1) < 1 || g[0] != 'Y') {
+        if (gfd >= 0) close(gfd);
+        fprintf(stderr, "T2 FAIL kernel TEE session guard not active; daemon NOT started\n");
+        return -1;
+    }
+    close(gfd);
+    printf("T2 kernel TEE session guard: on\n");
     const char *dir = "/dev/crownlte/t2-node", *node = "/dev/crownlte/t2-node/mobicore-user";
     unsigned ama, ami, uma, umi;
     if (t2_read_devt("/sys/class/trustonic_tee/mobicore/dev", &ama, &ami) ||

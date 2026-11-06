@@ -54,9 +54,9 @@ static void mk(struct seccomp_data *d, uint32_t arch, int nr, uint64_t a1)
 }
 int main(void)
 {
-	static const uint32_t allow[] = {0x80204d00, 0x80084d01, 0x40184d03, 0x80604d09, 0x00004d08};
-	static const uint32_t deny[] = {0x40184d02, 0x40184d04, 0xc0404d00, 0xc0284d01, 0x4d02, 0x4d03,
-					0x400c4d04, 0xc0284d05, 0xc0084d07};
+	static const uint32_t allow[] = {0x80204d00, 0x80084d01, 0x40184d03, 0x80604d09, 0x00004d08,
+					 0xc0404d00, 0x4d02, 0x4d03, 0x400c4d04, 0xc0284d05, 0x40284d06, 0xc0084d07};
+	static const uint32_t deny[] = {0x40184d02, 0x40184d04, 0xc0284d01, 0x40084d14, 0xc0e04d18};
 	struct seccomp_data d;
 	int fails = 0;
 	if (restrict_tee() || !capn) {
