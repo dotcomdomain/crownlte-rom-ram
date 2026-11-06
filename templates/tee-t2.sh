@@ -35,7 +35,11 @@ for n in $(seq 1 95); do
     # Drain each byte range once; bound serial output separately from trace storage.
     size=$(stat -c %s /dev/crownlte/tee-t2.strace 2>/dev/null)
     if [ -n "$size" ] && [ "$size" -ge "$offset" ]; then
-        tail -c +$offset /dev/crownlte/tee-t2.strace | head -c $((size - offset + 1)) | grep -E 'mobicore|/efs|mcRegistry|TbStorage|EROFS|EACCES|EPERM|exited with|killed by' | head -100
+        tail -c +$offset /dev/crownlte/tee-t2.strace | head -c $((size - offset + 1)) |
+            grep -E 'mobicore|/efs|mcRegistry|TbStorage|EROFS|EACCES|EPERM|exited with|killed by' > /dev/crownlte/t2-match.txt
+        m=$(wc -l < /dev/crownlte/t2-match.txt)
+        head -100 /dev/crownlte/t2-match.txt
+        [ "$m" -gt 100 ] && echo "T2 audit TRUNCATED poll $n: 100 of $m matching trace lines shown"
         offset=$((size + 1))
     fi
     logcat -b all -d -t 60 -v brief 2>&1 | grep -E 'McDaemon|MobiCore|mobicore|mcDriver|Trustonic' | head -30
@@ -43,5 +47,12 @@ for n in $(seq 1 95); do
     kill -0 "$runner" 2>/dev/null || break
 done
 wait "$runner"
+# Whole-trace totals (never truncated): write-type syscalls on protected paths and refusals.
+if [ -r /dev/crownlte/tee-t2.strace ]; then
+    echo "T2 trace totals: lines=$(wc -l < /dev/crownlte/tee-t2.strace)"
+    echo "T2 trace writes to /efs or registry: $(grep -E '^[0-9]+ +(write|pwrite64|writev|fsync)\([0-9]+<[^>]*(/efs|mcRegistry|TbStorage)' /dev/crownlte/tee-t2.strace | wc -l)"
+    echo "T2 trace EROFS=$(grep -c EROFS /dev/crownlte/tee-t2.strace) EACCES=$(grep -c EACCES /dev/crownlte/tee-t2.strace) EPERM=$(grep -c EPERM /dev/crownlte/tee-t2.strace)"
+    grep -E '^[0-9]+ +(write|pwrite64|writev|fsync)\([0-9]+<[^>]*(/efs|mcRegistry|TbStorage)' /dev/crownlte/tee-t2.strace | head -40
+fi
 echo "T2 supervisor exit status=$?"
 snapshot after

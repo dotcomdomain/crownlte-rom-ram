@@ -728,6 +728,47 @@ out:
 
 
 #ifdef RR_TEE_T2
+/* Binary-safe copy for T2 payload files larger than rr_copy's 256 KiB text buffer.
+ * Streams through rr_copy_fd, then re-hashes source and destination in full. */
+#define RR_T2_COPY_MAX (4ULL << 20)
+static int rr_t2_copy_bin(const char *src, const char *dst, mode_t mode)
+{
+        char a[65], b[65];
+        unsigned long long na = 0, nb = 0;
+        struct stat st;
+        int error, in, out;
+        in = open(src, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        if (in < 0)
+                return -errno;
+        if (fstat(in, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+            (unsigned long long)st.st_size > RR_T2_COPY_MAX) {
+                close(in);
+                return -EFBIG;
+        }
+        out = open(dst, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode);
+        if (out < 0) {
+                error = -errno;
+                close(in);
+                return error;
+        }
+        error = rr_copy_fd(in, out, (unsigned long long)st.st_size);
+        if (!error)
+                error = rr_sha_at0(in, a, &na);
+        if (!error)
+                error = rr_sha_at0(out, b, &nb);
+        if (!error && (na != (unsigned long long)st.st_size || nb != na || strcmp(a, b)))
+                error = -EIO;
+        if (!error && fchmod(out, mode))
+                error = -errno;
+        close(out);
+        close(in);
+        if (!error)
+                rr_log("T2 copied %s (%llu bytes, sha256 %s)", dst, na, a);
+        return error;
+}
+#endif
+
+#ifdef RR_TEE_T2
 /* Only EFS is read, once. The real device is never mounted or exposed. */
 static int rr_t2_efs(int nblk)
 {
@@ -987,7 +1028,7 @@ static int romram_child(void *unused)
         (void)&rr_frp_setup;
         RR_DO("tee-t2-efs-copy", rr_t2_efs(nblk));
         RR_DO("tee-t2-script", rr_copy(RR_PAYLOAD "/tee-t2.sh", RR_ROOT "/dev/crownlte/tee-t2.sh", 0755));
-        RR_DO("tee-t2-runner", rr_copy(RR_PAYLOAD "/tee-t2-run", RR_ROOT "/dev/crownlte/tee-t2-run", 0755));
+        RR_DO("tee-t2-runner", rr_t2_copy_bin(RR_PAYLOAD "/tee-t2-run", RR_ROOT "/dev/crownlte/tee-t2-run", 0755));
         /* A read-only regular-file mount permanently occupies the user-session node. */
         RR_DO("tee-t2-no-clients", rr_write(RR_ROOT "/dev/mobicore-user", "", 0, 0000));
         RR_DO("tee-t2-no-clients-mask", rr_mask_file(RR_ROOT "/dev/mobicore-user"));
