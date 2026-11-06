@@ -26,7 +26,7 @@ exec > >(tee build.log) 2>&1
 } > romram-sha256.h
 cp "$SRC"/init.c "$SRC"/romram.h "$SRC"/romram-host-test.c "$SRC"/gen_payload.py .
 cp -r "$SRC"/templates .
-if [ "${TEE_T2:-0}" = 1 ]; then cp "$SRC"/tee-t2-run.c .; fi
+if [ "${TEE_T2:-0}" = 1 ]; then cp "$SRC"/tee-t2-run.c "$SRC"/t2-seccomp-fixture.c .; fi
 
 # 1. Composite read-only root from the partition backups (as the phone mounts them).
 if ! mountpoint -q "$TR"; then
@@ -71,6 +71,8 @@ mkdir rootfs
 cp init rootfs/init; chmod 0755 rootfs/init
 cp -r payload/crownlte rootfs/crownlte
 if [ "${TEE_T2:-0}" = 1 ]; then
+  gcc -I. -O1 -Wall -Wextra -Werror -Wno-unused-function t2-seccomp-fixture.c -o t2-seccomp-fixture
+  ./t2-seccomp-fixture | tee t2-seccomp-fixture.log
   aarch64-linux-gnu-gcc -static -Os -Wall -Wextra -Werror tee-t2-run.c -o tee-t2-run
   cp tee-t2-run rootfs/crownlte/tee-t2-run
 fi
