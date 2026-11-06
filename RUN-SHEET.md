@@ -921,3 +921,8 @@ refuses a live TEE (`ROM stage STOPPED stage=tee-must-be-off`), so Lineage and a
    `adb connect` to a scoped address is untested.
 6. ADB_ROOT side effects beyond the list above. Any adb host on this USB link has key-authorized
    access. The key is the test PC key.
+
+### ADB security notes (Sol R1 S1-S3, 2026-11-06)
+- The storage and sysfs masks are NOT a security boundary against the root adb shell (ADB_ROOT=1). Root in the container can mknod block nodes, clear BLKROSET, unmount masks or mount a fresh sysfs, and so can READ real partitions including EFS. Writes are still refused by the kernel UFS SCSI write guard (the backstop). Acceptable only because the adb session is the operators own diagnostic channel; never treat ADB_ROOT packs as containment for untrusted code.
+- Default-build identity: compare the default builds by rebuilding with ADB unset and running cmp on diagnostic-initramfs.cpio.gz; record both full hashes and the build flags when claiming identity.
+- templates/adb.sh "ESTABLISHED" only means a TCP peer connected, not that adb authenticated. The authenticated PASS is the Windows helper's adb shell check.
