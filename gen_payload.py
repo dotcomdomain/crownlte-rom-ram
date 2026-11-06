@@ -15,7 +15,7 @@ and OUT/sanitize-report.txt (unified diffs + every dangerous-pattern decision).
 The generator refuses to finish if any rc line matches a storage-mutating
 pattern that no explicit rule handles.
 """
-import difflib, hashlib, os, re, shlex, stat, sys
+import base64, difflib, hashlib, os, re, shlex, stat, struct, sys
 from pathlib import Path
 
 ROOT = Path(sys.argv[1])
@@ -28,6 +28,14 @@ TEE_T2 = os.environ.get('TEE_T2', '0') == '1'
 if TEE_T2 and DEADLINE != '600':
     raise SystemExit('TEE_T2 requires DEADLINE=600')
 SHOWCASE = os.environ.get('SHOWCASE', '0') == '1'
+# ADB=1: adb over the USB NCM link PID1 adds to its gadget (init.c, -DRR_ADB).
+# ADB_PUBKEY names the host's adb PUBLIC key (adbkey.pub format); it is the
+# only key installed (RAM /data/misc/adb/adb_keys). ADB_ROOT=1 additionally
+# makes the container debuggable (ro.debuggable 0 -> 1) so `adb root` works.
+ADB = os.environ.get('ADB', '0') == '1'
+ADB_ROOT = os.environ.get('ADB_ROOT', '0') == '1'
+if ADB_ROOT and not ADB:
+    raise SystemExit('ADB_ROOT=1 requires ADB=1')
 
 PARTS = [('SYSTEM', '/', 'SYSTEM.img'), ('VENDOR', '/vendor', 'VENDOR.img'), ('ODM', '/odm', 'ODM.img')]
 BACKUPS = Path('/mnt/ssd/host-builds/kernel-upgrade/backups-20261103/partitions')
@@ -103,6 +111,10 @@ FEATURE_DROP = {
 PROP_SET = {
     '/vendor/build.prop': [('ro.vendor.ddk.set.afbc', '1', '0')],
 }
+# ADB_ROOT=1: this Lineage userdebug build ships ro.debuggable=0 (system/build.prop),
+# so adbd answers `adb root` with "cannot run as root in production builds".
+if ADB_ROOT:
+    PROP_SET['/system/build.prop'] = [('ro.debuggable', '0', '1')]
 # Other prop files init loads (must not define a PROP_SET key).
 PROP_FILES = ['/system/build.prop', '/system/system_ext/etc/build.prop',
               '/system/product/etc/build.prop', '/system/etc/prop.default', '/vendor/default.prop',
@@ -121,6 +133,32 @@ CMDLINE_EXTRA = ('androidboot.hardware=samsungexynos9810 androidboot.selinux=per
 
 sha = lambda b: hashlib.sha256(b).hexdigest()
 report = []
+
+
+def adb_pubkey(path):
+    # One line "<base64 of the 524-byte RSA-2048 adb public key> <comment>".
+    # Anything else, in particular a PEM private key, is refused.
+    if not path:
+        raise SystemExit('ADB=1 needs ADB_PUBKEY=<path of adbkey.pub>')
+    raw = Path(path).read_bytes()
+    if b'PRIVATE' in raw or b'BEGIN' in raw:
+        raise SystemExit('ADB_PUBKEY looks like a private key; refusing')
+    lines = raw.decode('ascii').splitlines()
+    if len(lines) != 1 or ' ' not in lines[0]:
+        raise SystemExit('ADB_PUBKEY: expected exactly one "<base64> <comment>" line')
+    b64, comment = lines[0].split(' ', 1)
+    blob = base64.b64decode(b64, validate=True)
+    if len(blob) != 524:
+        raise SystemExit(f'ADB_PUBKEY: not an adb RSA-2048 public key (decoded length {len(blob)})')
+    words, exponent = struct.unpack_from('<I', blob, 0)[0], struct.unpack_from('<I', blob, 520)[0]
+    if words != 64 or exponent != 65537:
+        raise SystemExit(f'ADB_PUBKEY: not an adb RSA-2048 public key (words {words}, e {exponent})')
+    if not comment or not all(0x20 < ord(c) < 0x7f or c == ' ' for c in comment):
+        raise SystemExit('ADB_PUBKEY: bad comment')
+    return lines[0]
+
+
+ADB_KEY = adb_pubkey(os.environ.get('ADB_PUBKEY', '')) if ADB else None
 
 
 def prop_set(cpath, text):
@@ -357,13 +395,45 @@ service crownlte_tee_t2 /system/bin/sh /dev/crownlte/tee-t2.sh
     disabled
     oneshot
 ''')
-    (pay / 'cmdline-extra').write_text(CMDLINE_EXTRA + (' androidboot.crownlte_showcase=1' if SHOWCASE else '') + '\n')
+    if ADB:
+        (pay / 'adb_keys').write_text(ADB_KEY + '\n')
+        (pay / 'adb.sh').write_bytes((TEMPLATES / 'adb.sh').read_bytes())
+        with (pay / 'init.diag.rc').open('a') as f:
+            f.write('''
+# ADB=1: adb over the USB NCM link (crownadb0) in PID1's composite gadget; the
+# ACM log port is unchanged. adbd listens on TCP 5555 (no USB functionfs path:
+# PID1 owns the UDC, so Android's g1 gadget never binds). adb.sh installs the
+# host's public key into the RAM /data and configures the link.
+on post-fs-data
+    setprop service.adb.tcp.port 5555
+    setprop persist.sys.usb.config adb
+    start crownlte_adb
+
+# sys.usb.config=none (UsbDeviceManager switching functions) stops adbd; start
+# it again so TCP adb survives. adbd's own restarts (adb root) are "restarting".
+on property:init.svc.adbd=stopped && property:ro.boot.crownlte_adb=1
+    start adbd
+
+on property:init.svc.adbd=*
+    write /dev/kmsg "<6>crownlte-romram: ADB init.svc.adbd=${init.svc.adbd}"
+
+service crownlte_adb /system/bin/sh /dev/crownlte/adb.sh
+    user root
+    group root system shell log readproc inet net_admin net_raw
+    seclabel u:r:su:s0
+    disabled
+    oneshot
+''')
+    extra = (' androidboot.crownlte_showcase=1' if SHOWCASE else '') + (' androidboot.crownlte_adb=1' if ADB else '')
+    (pay / 'cmdline-extra').write_text(CMDLINE_EXTRA + extra + '\n')
     (pay / 'deadline_seconds').write_text(DEADLINE + '\n')
     (pay / 'bypass_enabled').write_text('1\n')
     (pay / 'empty').write_bytes(b'')
+    adb_id = (f'; adb 1 key sha256 {sha((ADB_KEY + chr(10)).encode())} root {int(ADB_ROOT)}' if ADB else '')
     (pay / 'payload-id').write_text(
         f'crownlte-rom-ram payload; manifest sha256 {sha(manifest)}; deadline {DEADLINE}s; '
-        f'bypass enabled; showcase {int(SHOWCASE)}; rc replacements {sorted(repls)}; empties {sorted(EMPTY)}\n')
+        f'bypass enabled; showcase {int(SHOWCASE)}; rc replacements {sorted(repls)}; empties {sorted(EMPTY)}'
+        f'{adb_id}\n')
     (OUT / 'sanitize-report.txt').write_text('\n'.join(report) + '\n')
     n = sum(1 for l in lines if l[:1] in 'FLDA')
     print(f'manifest entries={n} replacements={len(repls)} empties={len(EMPTY)} sha={sha(manifest)}')

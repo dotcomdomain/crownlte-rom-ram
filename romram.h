@@ -1044,6 +1044,12 @@ static int romram_child(void *unused)
         RR_DO("payload-user0", rr_copy(RR_PAYLOAD "/init_user0.sh", RR_ROOT "/dev/crownlte/init_user0.sh", 0755));
         if (!access(RR_PAYLOAD "/bypass_enabled", F_OK))
                 RR_DO("payload-bypass", rr_write(RR_ROOT "/dev/crownlte/bypass_enabled", "1\n", 2, 0644));
+#ifdef RR_ADB
+        /* ADB=1: network/keys script and the host's adb PUBLIC key (one line). */
+        RR_DO("payload-adb", rr_copy(RR_PAYLOAD "/adb.sh", RR_ROOT "/dev/crownlte/adb.sh", 0755));
+        RR_DO("payload-adb-keys", rr_copy(RR_PAYLOAD "/adb_keys", RR_ROOT "/dev/crownlte/adb_keys", 0644));
+        rr_log("ADB payload: adb.sh and adb_keys (public key) copied to container RAM /dev/crownlte");
+#endif
 
         /* androidboot.* for second-stage init; extras first so they win. */
         RR_DO("read-cmdline", rr_text("/proc/cmdline", cmdline, sizeof(cmdline)));

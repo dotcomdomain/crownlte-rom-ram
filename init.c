@@ -202,6 +202,95 @@ static void usb_report(const struct usb_result *result,
         }
 }
 
+#ifdef RR_ADB
+/*
+ * ADB=1: a CDC NCM function next to the ACM log port in the same gadget.
+ * ACM stays first (interfaces 0/1, ttyGS0, unchanged frame protocol); NCM is
+ * interfaces 2/3. The device class becomes IAD/composite (EF/02/01) so the
+ * host binds each function separately (Windows: usbser + in-box UsbNcm), and
+ * the serial number differs so Windows creates a fresh device node instead of
+ * reusing the single-function usbser binding. The NCM netdev gets a name no
+ * Android tethering/ethernet regex matches. This process only creates the
+ * link; the container's adb.sh configures addresses. NCM never blocks the
+ * serial log: any NCM setup error, or two UDC bind failures with NCM linked,
+ * drops NCM and the gadget binds ACM-only as before.
+ */
+#define ADB_FN "/sys/kernel/config/usb_gadget/crownlte_diag/functions/ncm.usb0"
+#define ADB_LINK "/sys/kernel/config/usb_gadget/crownlte_diag/configs/c.1/ncm.usb0"
+#define ADB_IFNAME "crownadb%d"
+#define ADB_DEV_ADDR "02:43:52:4e:39:44"  /* phone side */
+#define ADB_HOST_ADDR "02:43:52:4e:39:48" /* host side: Windows adapter MAC */
+static int adb_ncm;             /* 0 not yet set up, 1 set up, -1 dropped (ACM only) */
+static int adb_ncm_bind_failures;
+
+static void adb_ncm_drop(const char *why, int error)
+{
+        int unlinked = unlink(ADB_LINK) ? -errno : 0;
+        adb_ncm = -1;
+        announce("ADB NCM dropped reason=%s errno=%d unlink=%d; gadget continues ACM-only (serial log unaffected)",
+                 why, -error, -unlinked);
+}
+
+/* Attributes are written once, before the first bind; never again (an
+ * earlier bind may already have registered the netdev). */
+static void adb_ncm_add(int trace)
+{
+        static const struct { const char *attr, *value; } attrs[] = {
+                { ADB_FN "/ifname", ADB_IFNAME },
+                { ADB_FN "/dev_addr", ADB_DEV_ADDR },
+                { ADB_FN "/host_addr", ADB_HOST_ADDR },
+        };
+        int error;
+        if (adb_ncm < 0)
+                return;
+        if (!adb_ncm) {
+                usb_begin(trace, "ADB mkdir ncm.usb0");
+                error = mk(ADB_FN);
+                if (error) {
+                        adb_ncm_drop("mkdir-ncm", error);
+                        return;
+                }
+                for (size_t i = 0; i < sizeof(attrs) / sizeof(attrs[0]); i++) {
+                        usb_begin(trace, attrs[i].attr);
+                        error = put(attrs[i].attr, attrs[i].value);
+                        if (error) {
+                                adb_ncm_drop(attrs[i].attr, error);
+                                return;
+                        }
+                }
+                adb_ncm = 1;
+        }
+        usb_begin(trace, "ADB link ncm.usb0");
+        if (symlink(ADB_FN, ADB_LINK) && errno != EEXIST)
+                adb_ncm_drop("symlink-ncm", -errno);
+}
+
+static void adb_ncm_bind_failed(int error)
+{
+        if (adb_ncm > 0 && ++adb_ncm_bind_failures >= 2)
+                adb_ncm_drop("udc-bind-failed-twice", error);
+}
+
+static void adb_ncm_report(void)
+{
+        char ifname[32] = "";
+        int fd;
+        if (adb_ncm <= 0) {
+                announce("ADB NCM not in the bound gadget (ACM only); no adb link this boot");
+                return;
+        }
+        fd = open(ADB_FN "/ifname", O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+                ssize_t n = read(fd, ifname, sizeof(ifname) - 1);
+                close(fd);
+                ifname[n > 0 ? n : 0] = 0;
+                ifname[strcspn(ifname, "\n")] = 0;
+        }
+        announce("ADB NCM bound with ACM: ifname=%s dev_addr=%s host_addr=%s class=EF/02/01 serial=crownlte-romram-adb",
+                 ifname[0] ? ifname : "unreadable", ADB_DEV_ADDR, ADB_HOST_ADDR);
+}
+#endif
+
 static int gadget(struct usb_result *result, int config_error, int trace)
 {
         const char *base = "/sys/kernel/config/usb_gadget/crownlte_diag";
@@ -244,13 +333,25 @@ static int gadget(struct usb_result *result, int config_error, int trace)
 } while (0)
         SET("idVendor", "0x1d6b");
         SET("idProduct", "0x0104");
+#ifdef RR_ADB
+        SET("bDeviceClass", "0xef");
+        SET("bDeviceSubClass", "0x02");
+        SET("bDeviceProtocol", "0x01");
+#else
         SET("bDeviceClass", "0x02");
         SET("bDeviceSubClass", "0");
         SET("bDeviceProtocol", "0");
+#endif
         MAKE("/sys/kernel/config/usb_gadget/crownlte_diag/strings/0x409");
+#ifdef RR_ADB
+        SET("strings/0x409/serialnumber", "crownlte-romram-adb");
+        SET("strings/0x409/manufacturer", "Kernel bring-up");
+        SET("strings/0x409/product", "Note9 kernel diagnostic serial + adb NCM");
+#else
         SET("strings/0x409/serialnumber", "crownlte-source-diagnostic");
         SET("strings/0x409/manufacturer", "Kernel bring-up");
         SET("strings/0x409/product", "Note9 kernel diagnostic serial");
+#endif
         MAKE("/sys/kernel/config/usb_gadget/crownlte_diag/configs/c.1");
         MAKE("/sys/kernel/config/usb_gadget/crownlte_diag/configs/c.1/strings/0x409");
         SET("configs/c.1/strings/0x409/configuration", "Read-only diagnostic logs");
@@ -261,15 +362,25 @@ static int gadget(struct usb_result *result, int config_error, int trace)
                     "/sys/kernel/config/usb_gadget/crownlte_diag/configs/c.1/acm.usb0")
             && errno != EEXIST)
                 return usb_fail(result, "configfs-link-failed", "symlink acm.usb0", -errno);
+#ifdef RR_ADB
+        adb_ncm_add(trace);
+#endif
         usb_begin(trace, "bind UDC");
         snprintf(path, sizeof(path), "%s/UDC", base);
         error = put(path, name);
-        if (error)
+        if (error) {
+#ifdef RR_ADB
+                adb_ncm_bind_failed(error);
+#endif
                 return usb_fail(result, "udc-bind-failed", "write UDC", error);
+        }
 #undef SET
 #undef MAKE
         result->stage = "gadget-bound";
         result->operation = "write UDC";
+#ifdef RR_ADB
+        adb_ncm_report();
+#endif
         return 0;
 }
 

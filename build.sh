@@ -36,7 +36,12 @@ if ! mountpoint -q "$TR"; then
   mount -o ro,loop,noload "$P/ODM.img" "$TR/odm"
 fi
 
-# 2. Payload.
+# 2. Payload. ADB=1 needs ADB_PUBKEY (host adbkey.pub; public key only).
+if [ "${ADB:-0}" = 1 ]; then
+  test -f "${ADB_PUBKEY:-}"
+  ADB_PUBKEY=$(readlink -f "$ADB_PUBKEY"); export ADB_PUBKEY
+  echo "ADB=1 ADB_ROOT=${ADB_ROOT:-0} pubkey $ADB_PUBKEY sha256 $(sha256sum < "$ADB_PUBKEY" | cut -c1-64)"
+fi
 DEADLINE=${DEADLINE:-600} python3 gen_payload.py "$TR" payload
 
 # 3. Host test of the manifest verifier against the real images (+ negatives).
@@ -62,6 +67,7 @@ if [ "${TEE_T2:-0}" = 1 ]; then
   test "${DEADLINE:-600}" = 600
   T2_CFLAGS=(-DRR_TEE_T2)
 fi
+if [ "${ADB:-0}" = 1 ]; then T2_CFLAGS+=(-DRR_ADB); fi
 aarch64-linux-gnu-gcc "${T2_CFLAGS[@]}" -static -std=gnu11 -Os -Wall -Wextra -Werror -Wno-format-truncation init.c -o init
 aarch64-linux-gnu-readelf -h -l init > init-readelf.txt
 if grep -q INTERP init-readelf.txt; then echo "init is dynamic"; exit 1; fi
