@@ -992,7 +992,21 @@ Lineage init:
   Harmless.
 - The rw window is inside the blocking helper (init runs nothing else meanwhile). It is RAM only.
 
-Expected (build-31 EFS set):
+Artifacts (gekko rom-ram/, build-only, UNTESTED on the phone):
+- build-31 (src 39f2eaf, ramdisk 68acee0d...): first EFS_RO build. Its pack
+  `pack-romram-bt-b1-hal-r2-efs` (recovery b1f34213...) is SUPERSEDED (Sol R1: the ro remount
+  failed open and the probe could report a false PASS); deleted on gekko, a copy is on the PC.
+- build-32 (src 46a3670, same flags: `ADB=1 ADB_ROOT=1 ADB_PUBKEY=... EFS_RO_DIR=...`, absolute
+  paths in build-32/BUILD-CMD.txt): ramdisk
+  `82771399d5af1ff8afc6b575ef8edddd57d5ea5cc30db67084e7a05ec848f3fa`. Differs from build-31 only
+  in `init`, `init.diag.rc`, `probe.sh` and the new `efs-ro.sh`; manifest c623622e and efs-ro
+  list 430a4c99 unchanged.
+- `pack-romram-bt-b1-hal-r2-efs2`: same inputs as the old efs pack (Image c08c45b8, DTB
+  romram-bt-b1 adedcd7d, shim bbea959, parent a8198be0) except the ramdisk (build-32). recovery
+  `f2a8ee3d2a7d1fe75a682dd662a4a46b38247d2a53ff44a414d8570c498e9721`, mode 0600 (contains the
+  MACs). Restore RECOVERY 8763860c afterwards.
+
+Expected (build-31/build-32 EFS set):
 
 | path | owner | mode | label |
 |---|---|---|---|
