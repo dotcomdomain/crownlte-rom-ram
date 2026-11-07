@@ -44,17 +44,39 @@ while true; do
     echo "--- afbc ro.vendor.ddk.set.afbc=$(getprop ro.vendor.ddk.set.afbc)"
     ls -lL /dev/block/persistent 2>&1; ls -l /dev/block/persistent /dev/block/platform/11120000.ufs/by-name 2>&1
   fi
-  # EFS_RO_DIR builds (after on fs): mounts, owners, modes, labels; never contents.
-  if [ $n -eq 6 ] && grep -q ' /mnt/vendor/efs tmpfs ' /proc/mounts; then
+  # EFS_RO_DIR builds (efs-ro.sh present; after on fs): mounts, owners, modes,
+  # labels; never contents. PASS needs BOTH /mnt/vendor/efs and the /efs bind:
+  # exactly one tmpfs mount each, first option ro, and a new file refused with
+  # EROFS. Writable = FAIL; any other refusal (ENOSPC, EACCES, ...) = INCONCLUSIVE.
+  if [ $n -eq 6 ] && [ -e /dev/crownlte/efs-ro.sh ]; then
     echo "--- efs-ro"
     grep -E ' /(mnt/vendor/)?efs ' /proc/mounts
     ls -laRZ /mnt/vendor/efs 2>&1
-    if msg=$(touch /mnt/vendor/efs/.crownlte-ro-test 2>&1); then
-      rm -f /mnt/vendor/efs/.crownlte-ro-test
-      echo "efs-ro FAIL: /mnt/vendor/efs is writable"
-    else
-      echo "efs-ro PASS: /mnt/vendor/efs refuses a new file: $msg"
-    fi
+    efs_res=PASS; efs_why=
+    for d in /mnt/vendor/efs /efs; do
+      c=0; ty=-; op=-
+      while read -r dev mp t o rest; do
+        [ "$mp" = "$d" ] && { c=$((c + 1)); ty=$t; op=$o; }
+      done < /proc/mounts
+      if [ $c -ne 1 ] || [ "$ty" != tmpfs ]; then
+        efs_res=FAIL; efs_why="$efs_why; $d: $c mounts, type $ty (want 1 tmpfs)"; continue
+      fi
+      case ",$op," in
+        ,ro,*) ;;
+        *) efs_res=FAIL; efs_why="$efs_why; $d: options $op (want ro)" ;;
+      esac
+      if msg=$(touch "$d/.crownlte-ro-test" 2>&1); then
+        rm -f "$d/.crownlte-ro-test"
+        efs_res=FAIL; efs_why="$efs_why; $d: writable (new file created)"
+      else
+        case "$msg" in
+          *"Read-only file system"*) efs_why="$efs_why; $d: ro, write refused EROFS" ;;
+          *) [ $efs_res = PASS ] && efs_res=INCONCLUSIVE
+             efs_why="$efs_why; $d: write refused but not EROFS: $msg" ;;
+        esac
+      fi
+    done
+    echo "efs-ro $efs_res: ${efs_why#; }"
   fi
   if [ $((n % 3)) -eq 0 ]; then
     echo "--- ps"

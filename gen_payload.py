@@ -534,19 +534,33 @@ service crownlte_adb /system/bin/sh /dev/crownlte/adb.sh
         (pay / 'efs-ro' / 'list').write_text(efs_list)
         for pname, data in efs_files.items():
             (pay / 'efs-ro' / pname).write_bytes(data)
+        (pay / 'efs-ro.sh').write_bytes((TEMPLATES / 'efs-ro.sh').read_bytes())
         with (pay / 'init.diag.rc').open('a') as f:
             f.write('''
 # EFS_RO_DIR: PID1 made /mnt/vendor/efs a RAM tmpfs holding sha256-verified
 # copies of a few EFS files and remounted it read-only; the EFS partition is
-# never mounted. Labels need the loaded policy, so: rw, restorecon, ro again.
+# never mounted. Labels need the loaded policy, so efs-ro.sh remounts rw, runs
+# restorecon -R, remounts ro and then requires ro (mount flags + an EROFS write
+# test). exec_start blocks init until it exits; reboot_on_failure turns any
+# failure into a namespace reboot (ROM stage ends, the deadline restarts the
+# phone), so the actions below and the vendor's never run on a writable efs.
+# wait_for_prop covers a helper that never ran (exec_start error, e.g. a
+# service parse failure): init then blocks here until the deadline.
 # This file is parsed before its imports, so this runs before the vendor's
 # "on fs" action, whose "mount none /mnt/vendor/efs /efs bind" then shows the
 # same read-only mount at /efs (its restorecon/chown there fail with EROFS).
 on fs
-    mount tmpfs tmpfs /mnt/vendor/efs remount nosuid nodev noexec
-    restorecon_recursive /mnt/vendor/efs
-    mount tmpfs tmpfs /mnt/vendor/efs remount ro nosuid nodev noexec
-    write /dev/kmsg "<6>crownlte-romram: efs-ro labels restored, /mnt/vendor/efs remount ro issued"
+    exec_start crownlte_efs_ro
+    wait_for_prop crownlte.efs_ro ok
+    write /dev/kmsg "<6>crownlte-romram: efs-ro crownlte.efs_ro=ok; vendor on fs may proceed"
+
+service crownlte_efs_ro /system/bin/sh /dev/crownlte/efs-ro.sh
+    user root
+    group root
+    seclabel u:r:su:s0
+    disabled
+    oneshot
+    reboot_on_failure reboot,crownlte-efs-ro
 ''')
     extra = (' androidboot.crownlte_showcase=1' if SHOWCASE else '') + (' androidboot.crownlte_adb=1' if ADB else '')
     (pay / 'cmdline-extra').write_text(CMDLINE_EXTRA + extra + '\n')

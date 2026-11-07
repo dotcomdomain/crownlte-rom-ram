@@ -49,6 +49,8 @@ if [ -n "${EFS_RO_DIR:-}" ]; then
   EFS_RO_DIR=$(readlink -f "$EFS_RO_DIR"); export EFS_RO_DIR
   echo "EFS_RO_DIR=$EFS_RO_DIR MANIFEST sha256 $(sha256sum < "$EFS_RO_DIR/MANIFEST" | cut -c1-64)"
 fi
+# Shell templates must at least parse (POSIX sh; the phone runs mksh).
+for s in templates/*.sh; do sh -n "$s"; done
 DEADLINE=${DEADLINE:-600} python3 gen_payload.py "$TR" payload
 
 # 3. Host test of the manifest verifier against the real images (+ negatives).

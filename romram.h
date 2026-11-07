@@ -1317,8 +1317,9 @@ static int romram_child(void *unused)
          * verified copies of the listed EFS files, then read-only. The EFS
          * partition itself is never opened. The vendor "on fs" action binds
          * /mnt/vendor/efs onto /efs (same mount, as on the phone); the
-         * EFS_RO "on fs" action in init.diag.rc runs first and restores the
-         * SELinux labels (rw -> restorecon -> ro). */
+         * EFS_RO "on fs" action in init.diag.rc runs first: exec_start of
+         * efs-ro.sh (rw -> restorecon -> ro, then ro is required; any
+         * failure is a namespace reboot via reboot_on_failure). */
         if (!access(RR_EFS_LIST, F_OK)) {
                 unsigned efs_n = 0;
 #ifdef RR_TEE_T2
@@ -1332,6 +1333,7 @@ static int romram_child(void *unused)
                                                     MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL));
                 RR_DO("efs-ro-readonly-check", rr_ro_mounted(RR_EFS_DST));
                 RR_DO("efs-ro-recheck", rr_efs_apply(RR_EFS_LIST, NULL, RR_EFS_DST, 1, &efs_n));
+                RR_DO("efs-ro-script", rr_copy(RR_PAYLOAD "/efs-ro.sh", RR_ROOT "/dev/crownlte/efs-ro.sh", 0755));
                 rr_log("efs-ro: %u files, sha ok", efs_n);
         }
 

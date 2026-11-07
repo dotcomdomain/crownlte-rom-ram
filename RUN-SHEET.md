@@ -932,7 +932,7 @@ refuses a live TEE (`ROM stage STOPPED stage=tee-must-be-off`), so Lineage and a
 Why: the B1-hal trial (2026-11-07) showed `android.hardware.bluetooth@1.0-service` aborting with
 "Open: No Bluetooth Address!" because ROM-RAM never mounts EFS, so `/efs/bluetooth/bt_addr` is
 missing. This option is off by default. Builds without it differ only in `init` (unused code) and
-`probe.sh` (an extra block that only runs when the mount exists).
+`probe.sh` (an extra block that only runs when `/dev/crownlte/efs-ro.sh` exists).
 
 Input: `EFS_RO_DIR=<dir>` holding `MANIFEST` and the files it names. Keep the dir outside git,
 mode 0700. On gekko: `rom-ram/efs-ro/` (bt_addr and wifi.mac.info copied read-only from the phone's 4.9 Lineage).
@@ -946,8 +946,9 @@ Build time (`gen_payload.py`):
 - Owners come from a fixed AID table. Modes must be <= 0777.
 - An optional label must equal what plat+vendor file_contexts give `/mnt/vendor/efs/<path>`.
 - Refused together with TEE_T2, which mounts a real EFS copy at the same place.
-- Output: `/crownlte/efs-ro/list` plus `f0..fN` (0400 in the cpio), a payload-id suffix, and an
-  `on fs` block appended to init.diag.rc.
+- Output: `/crownlte/efs-ro/list` plus `f0..fN` (0400 in the cpio), `/crownlte/efs-ro.sh`
+  (templates/efs-ro.sh), a payload-id suffix, and an `on fs` block plus the `crownlte_efs_ro`
+  service appended to init.diag.rc.
 - The host test populates and re-checks the list into an empty directory and must refuse a
   wrong-sha list. Its temp dirs are deleted.
 - File bytes are never printed.
@@ -958,19 +959,38 @@ Boot (PID1, `romram.h` step 5e, before the switch to Lineage init):
    re-hash the copy.
 3. Remount read-only (MS_REMOUNT|MS_RDONLY) and require ST_RDONLY.
 4. Re-check every entry (type, owner, mode, sha256).
-5. Log exactly one line: `crownlte-romram: efs-ro: N files, sha ok`.
+5. Copy efs-ro.sh to the container's RAM `/dev/crownlte/efs-ro.sh` (0755).
+6. Log exactly one line: `crownlte-romram: efs-ro: N files, sha ok`.
 
 Any failure stops the ROM stage (`stage=efs-ro-*`), like any other manifest failure. The EFS partition is never opened.
 
 Lineage init:
 - The EFS_RO `on fs` block in init.diag.rc runs first, because init parses this file before its
-  imports. It remounts rw, runs `restorecon_recursive /mnt/vendor/efs` (labels need the loaded
-  policy; labels set before policy load do not survive on tmpfs), then remounts ro.
+  imports. It runs `exec_start crownlte_efs_ro`: init blocks until `efs-ro.sh` exits (fix round
+  2026-11-07, Sol R1 #1; before that the init built-ins failed open). The script (su domain):
+  1. requires exactly one tmpfs mount at `/mnt/vendor/efs`, first option `ro`, plus
+     nosuid/nodev/noexec;
+  2. `mount -o remount,rw,nosuid,nodev,noexec`, checks `rw`;
+  3. `restorecon -R /mnt/vendor/efs` (labels need the loaded policy; labels set before policy
+     load do not survive on tmpfs);
+  4. `mount -o remount,ro,nosuid,nodev,noexec`, then requires the step-1 flags again (the kernel
+     prints `ro` when `__mnt_is_readonly`, the same test that sets ST_RDONLY) and a new-file
+     write refused with EROFS ("Read-only file system");
+  5. sets `crownlte.efs_ro=ok` (read back), logs
+     `K: crownlte-romram: efs-ro PASS labels restored; ... verified` and exits 0.
+  Any failed step logs `efs-ro FAIL stage=<step>` (priority 3), tries a best-effort ro remount
+  and exits 1. The service has `reboot_on_failure reboot,crownlte-efs-ro`, so a non-zero exit or a
+  failed start makes init reboot: the PID namespace ends (`signaled=1 signal=1`, namespace gone,
+  no retry) and the outer deadline restarts the phone. The init queue is cleared, so the rest of
+  `on fs` (including the vendor bind) never runs on a writable efs. A hang blocks init until the
+  deadline. After `exec_start` the action runs `wait_for_prop crownlte.efs_ro ok`, so a helper
+  that never ran (for example an init parse error in the service block, which turns `exec_start`
+  into a logged error) also blocks init until the deadline instead of failing open.
 - Then the vendor's own `on fs` runs `mount none /mnt/vendor/efs /efs bind`. That line was never
   disarmed. Until now it failed with ENOENT. Now /efs is the same read-only mount, as on the phone.
 - The vendor's restorecon/chown/chmod/mkdir on efs then find correct labels or fail with EROFS.
   Harmless.
-- The rw window covers the three commands inside one init action. It is RAM only.
+- The rw window is inside the blocking helper (init runs nothing else meanwhile). It is RAM only.
 
 Expected (build-31 EFS set):
 
@@ -984,16 +1004,24 @@ Expected (build-31 EFS set):
 
 PASS lines:
 - K: `crownlte-romram: efs-ro: 2 files, sha ok` (before `exec /system/bin/init`).
-- K: `efs-ro labels restored, /mnt/vendor/efs remount ro issued`.
+- K: `crownlte-romram: efs-ro PASS labels restored; /mnt/vendor/efs ro,nosuid,nodev,noexec verified
+  (1 tmpfs mount, write refused with EROFS: u:object_r:efs_file:s0 /mnt/vendor/efs)`.
+- K: `efs-ro crownlte.efs_ro=ok; vendor on fs may proceed`.
 - P (probe n=6, ~60 s): `--- efs-ro`, two `tmpfs ... ro,` mount lines (/mnt/vendor/efs and /efs),
-  `ls -laRZ` with the table above, and `efs-ro PASS: /mnt/vendor/efs refuses a new file: ... Read-only file system`.
+  `ls -laRZ` with the table above, and
+  `efs-ro PASS: /mnt/vendor/efs: ro, write refused EROFS; /efs: ro, write refused EROFS`.
+  The probe requires both mounts (exactly one tmpfs each, first option `ro`) and EROFS on both.
 - logcat: `get_local_address: Trying /efs/bluetooth/bt_addr` with no "No Bluetooth Address!" and no SIGABRT.
 
 Not PASS:
-- `stage=efs-ro-*` in the STOPPED line.
-- `efs-ro FAIL: ... writable`.
+- `stage=efs-ro-*` in the STOPPED line (PID1, before Lineage init).
+- `efs-ro FAIL stage=...` from the helper, then a namespace SIGHUP: `reboot_on_failure` ended
+  the ROM stage on purpose. Look at the stage name.
+- `efs-ro FAIL: ...` from the probe (a mount missing, not `ro`, or writable).
+- `efs-ro INCONCLUSIVE: ...`: the write was refused, but not with EROFS (for example ENOSPC or
+  EACCES), so it does not prove read-only.
 - An `rw` efs mount line.
-- `restorecon` labels left as `tmpfs`. Check whether the init `mount ... remount` failed in the init log.
+- `restorecon` labels left as `tmpfs` (the helper checks the restorecon exit status, not each label).
 
 Limits:
 - The root adb shell (ADB_ROOT=1) can remount the tmpfs rw. It is RAM only and is gone at the
