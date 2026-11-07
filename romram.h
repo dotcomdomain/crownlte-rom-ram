@@ -20,7 +20,9 @@
  *      (androidboot.* values) and a masked /proc/sysrq-trigger; a fresh sysfs
  *      with the UFS host, its driver bind/unbind, the UFS module parameters,
  *      the SCSI bus/classes, USB role/typec classes and /sys/power/{state,
- *      wakeup_count,mem_sleep,disk} hidden;
+ *      wakeup_count,mem_sleep,disk} hidden; EFS_RO_DIR builds only: a
+ *      read-only RAM tmpfs /mnt/vendor/efs with sha256-verified copies of a
+ *      few EFS files (the EFS partition stays unmounted);
  *   6. switches root (MS_MOVE + chroot) and execs /system/bin/init
  *      selinux_setup exactly like first-stage init would.
  * Any failed check before exec exits non-zero; nothing is retried.
@@ -341,6 +343,207 @@ static int rr_verify(struct rr_manifest *m, const char *root, const char *repl_d
         return 0;
 }
 
+/* ---------------------------------------------------------------- EFS_RO */
+/*
+ * EFS_RO_DIR builds only (gen_payload.py): /crownlte/efs-ro/list names a few
+ * files copied from the phone's EFS (e.g. bluetooth/bt_addr, which the vendor
+ * Bluetooth HAL aborts without); their bytes are /crownlte/efs-ro/f<N>.
+ *   D <relpath or .> <uid> <gid> <mode>
+ *   F <relpath> <uid> <gid> <mode> <size> <sha256> f<N>
+ * populate (check=0): create every entry in the empty directory dst (".":
+ * dst itself), with the listed owner/group/mode, checking size + sha256 of
+ * the payload before and of the copy after writing. check=1: re-verify type,
+ * owner, group, mode, size and sha256 in dst (src unused). File bytes and
+ * hashes are never logged.
+ */
+#define RR_EFS_MAX 16
+#define RR_EFS_FILE_MAX 4096
+
+static int rr_efs_name_ok(const char *p, int allow_slash)
+{
+        const char *s = p;
+        if (!*p)
+                return 0;
+        for (const char *c = p;; c++) {
+                if (*c == '/' || !*c) {
+                        size_t len = (size_t)(c - s);
+                        if (!len || (len == 1 && s[0] == '.') || (len == 2 && s[0] == '.' && s[1] == '.'))
+                                return 0;
+                        if (!*c)
+                                return 1;
+                        if (!allow_slash)
+                                return 0;
+                        s = c + 1;
+                        continue;
+                }
+                if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') ||
+                      *c == '.' || *c == '_' || *c == '-'))
+                        return 0;
+        }
+}
+
+static int rr_efs_hex_ok(const char *h)
+{
+        if (strlen(h) != 64)
+                return 0;
+        for (; *h; h++)
+                if (!((*h >= '0' && *h <= '9') || (*h >= 'a' && *h <= 'f')))
+                        return 0;
+        return 1;
+}
+
+/* sha256 + size of an open regular file, compared without logging either. */
+static int rr_efs_match(int fd, unsigned long long size, const char *sha)
+{
+        char hex[65];
+        unsigned long long got;
+        int error;
+        if (lseek(fd, 0, SEEK_SET) < 0)
+                return -errno;
+        if ((error = rr_sha_fd(fd, hex, &got)))
+                return error;
+        return got == size && !strcmp(hex, sha) ? 0 : -EBADMSG;
+}
+
+static int rr_efs_attrs(int fd, int want_dir, unsigned uid, unsigned gid, unsigned mode)
+{
+        struct stat st;
+        if (fstat(fd, &st))
+                return -errno;
+        if (want_dir ? !S_ISDIR(st.st_mode) : !S_ISREG(st.st_mode))
+                return -EBADMSG;
+        if (st.st_uid != uid || st.st_gid != gid || (st.st_mode & 07777) != mode)
+                return -EBADMSG;
+        return 0;
+}
+
+static int rr_efs_entry(char *line, const char *src, const char *dst, int check, unsigned *nfiles, int *root_seen)
+{
+        char rel[256], sha[65] = "", name[16] = "", path[RR_PATH * 2], buf[RR_EFS_FILE_MAX];
+        unsigned uid, gid, mode;
+        unsigned long long size = 0;
+        int end = -1, fd, error = 0, is_root;
+        if (line[0] == 'D') {
+                if (sscanf(line, "D %255s %u %u %o%n", rel, &uid, &gid, &mode, &end) != 4 || line[end])
+                        return -EINVAL;
+        } else if (line[0] == 'F') {
+                if (sscanf(line, "F %255s %u %u %o %llu %64s %15s%n", rel, &uid, &gid, &mode, &size, sha, name,
+                           &end) != 7 || line[end])
+                        return -EINVAL;
+                if (!size || size > RR_EFS_FILE_MAX || !rr_efs_hex_ok(sha) || name[0] != 'f' ||
+                    !name[1] || strspn(name + 1, "0123456789") != strlen(name + 1))
+                        return -EINVAL;
+        } else {
+                return -EINVAL;
+        }
+        is_root = line[0] == 'D' && !strcmp(rel, ".");
+        if (mode > 0777 || (!is_root && !rr_efs_name_ok(rel, 1)))
+                return -EINVAL;
+        /* "D ." comes first, exactly once. */
+        if (is_root ? *root_seen : !*root_seen)
+                return -EINVAL;
+        if (is_root)
+                *root_seen = 1;
+        if ((size_t)snprintf(path, sizeof(path), is_root ? "%s" : "%s/%s", dst, rel) >= sizeof(path))
+                return -ENAMETOOLONG;
+        if (line[0] == 'D') {
+                if (!is_root && !check && mkdir(path, 0700))
+                        return -errno;
+                fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+                if (fd < 0)
+                        return -errno;
+                if (!check && (fchown(fd, uid, gid) || fchmod(fd, mode)))
+                        error = -errno;
+                if (!error)
+                        error = rr_efs_attrs(fd, 1, uid, gid, mode);
+                close(fd);
+                return error;
+        }
+        if (!check) {
+                char from[RR_PATH * 2];
+                ssize_t n;
+                struct stat st;
+                if ((size_t)snprintf(from, sizeof(from), "%s/%s", src, name) >= sizeof(from))
+                        return -ENAMETOOLONG;
+                fd = open(from, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+                if (fd < 0)
+                        return -errno;
+                if (fstat(fd, &st) || !S_ISREG(st.st_mode))
+                        error = -EBADMSG;
+                if (!error)
+                        error = rr_efs_match(fd, size, sha);
+                if (!error) {
+                        n = pread(fd, buf, (size_t)size, 0);
+                        if (n != (ssize_t)size)
+                                error = -EIO;
+                }
+                close(fd);
+                if (error)
+                        return error;
+                fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+                if (fd < 0)
+                        return -errno;
+                n = write(fd, buf, (size_t)size);
+                if (n != (ssize_t)size)
+                        error = n < 0 ? -errno : -EIO;
+                if (!error && (fchown(fd, uid, gid) || fchmod(fd, mode)))
+                        error = -errno;
+                close(fd);
+                memset(buf, 0, sizeof(buf));
+                if (error)
+                        return error;
+        }
+        fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0)
+                return -errno;
+        error = rr_efs_attrs(fd, 0, uid, gid, mode);
+        if (!error)
+                error = rr_efs_match(fd, size, sha);
+        close(fd);
+        if (!error)
+                (*nfiles)++;
+        return error;
+}
+
+static int rr_efs_apply(const char *list, const char *src, const char *dst, int check, unsigned *nfiles)
+{
+        static char text[8192];
+        char *line, *next;
+        size_t used = 0;
+        ssize_t n;
+        int fd = open(list, O_RDONLY | O_NOFOLLOW | O_CLOEXEC), entries = 0, root_seen = 0, no = 0, error = 0;
+        *nfiles = 0;
+        if (fd < 0)
+                return -errno;
+        while ((n = read(fd, text + used, sizeof(text) - 1 - used)) > 0)
+                used += (size_t)n;
+        close(fd);
+        if (n < 0)
+                return -EIO;
+        if (used >= sizeof(text) - 1)
+                return -EOVERFLOW;
+        text[used] = 0;
+        for (line = text; line && *line; line = next) {
+                next = strchr(line, '\n');
+                if (next)
+                        *next++ = 0;
+                no++;
+                if (!*line || *line == '#')
+                        continue;
+                if (++entries > RR_EFS_MAX) {
+                        error = -E2BIG;
+                        break;
+                }
+                if ((error = rr_efs_entry(line, src, dst, check, nfiles, &root_seen)))
+                        break;
+        }
+        if (error) {
+                rr_log("efs-ro: list line %d rejected errno=%d (%s)", no, -error, check ? "check" : "populate");
+                return error;
+        }
+        return *nfiles ? 0 : -ENOENT;
+}
+
 #ifndef ROMRAM_HOST_TEST
 /* ---------------------------------------------------------------- device */
 #include <grp.h>
@@ -357,6 +560,8 @@ static int rr_verify(struct rr_manifest *m, const char *root, const char *repl_d
 #define RR_GUARD RR_UFS "/of_node/crownlte,read-only-diagnostic"
 #define AID_READPROC 3009
 #define AID_SYSTEM 1000
+#define RR_EFS_LIST RR_PAYLOAD "/efs-ro/list"
+#define RR_EFS_DST RR_ROOT "/mnt/vendor/efs"
 
 static int rr_kmsg = -1;
 static void rr_log(const char *fmt, ...)
@@ -1107,6 +1312,28 @@ static int romram_child(void *unused)
         RR_DO("second_stage_resources", rr_mount("tmpfs", RR_ROOT "/second_stage_resources", "tmpfs", MS_NOEXEC | MS_NOSUID | MS_NODEV, "mode=0755,uid=0,gid=0"));
         RR_DO("data", rr_mount("tmpfs", RR_ROOT "/data", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0771,uid=1000,gid=1000,size=1536m"));
         RR_DO("cache", rr_mount("tmpfs", RR_ROOT "/cache", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0770,uid=1000,gid=2001,size=64m"));
+
+        /* 5e. EFS_RO_DIR builds: /mnt/vendor/efs is a small RAM tmpfs with
+         * verified copies of the listed EFS files, then read-only. The EFS
+         * partition itself is never opened. The vendor "on fs" action binds
+         * /mnt/vendor/efs onto /efs (same mount, as on the phone); the
+         * EFS_RO "on fs" action in init.diag.rc runs first and restores the
+         * SELinux labels (rw -> restorecon -> ro). */
+        if (!access(RR_EFS_LIST, F_OK)) {
+                unsigned efs_n = 0;
+#ifdef RR_TEE_T2
+                RR_DO("efs-ro-with-tee-t2", -EINVAL);   /* T2 mounts a real EFS copy there */
+#endif
+                RR_DO("efs-ro-mkdir", mkdir(RR_EFS_DST, 0700) ? -errno : 0);
+                RR_DO("efs-ro-tmpfs", rr_mount("tmpfs", RR_EFS_DST, "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                                               "mode=0700,size=64k,nr_inodes=64"));
+                RR_DO("efs-ro-populate", rr_efs_apply(RR_EFS_LIST, RR_PAYLOAD "/efs-ro", RR_EFS_DST, 0, &efs_n));
+                RR_DO("efs-ro-remount-ro", rr_mount(NULL, RR_EFS_DST, NULL,
+                                                    MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL));
+                RR_DO("efs-ro-readonly-check", rr_ro_mounted(RR_EFS_DST));
+                RR_DO("efs-ro-recheck", rr_efs_apply(RR_EFS_LIST, NULL, RR_EFS_DST, 1, &efs_n));
+                rr_log("efs-ro: %u files, sha ok", efs_n);
+        }
 
 #ifdef RR_TEE_T2
         RR_DO("tee-t2-efs-alias", rr_mkdirs(RR_ROOT "/mnt/vendor/efs", 0755));

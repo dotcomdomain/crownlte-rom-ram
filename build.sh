@@ -42,6 +42,13 @@ if [ "${ADB:-0}" = 1 ]; then
   ADB_PUBKEY=$(readlink -f "$ADB_PUBKEY"); export ADB_PUBKEY
   echo "ADB=1 ADB_ROOT=${ADB_ROOT:-0} pubkey $ADB_PUBKEY sha256 $(sha256sum < "$ADB_PUBKEY" | cut -c1-64)"
 fi
+# EFS_RO_DIR=<dir with MANIFEST>: read-only RAM copies of selected EFS files
+# (gen_payload.py checks every sha256; file bytes are never printed).
+if [ -n "${EFS_RO_DIR:-}" ]; then
+  test -f "$EFS_RO_DIR/MANIFEST"
+  EFS_RO_DIR=$(readlink -f "$EFS_RO_DIR"); export EFS_RO_DIR
+  echo "EFS_RO_DIR=$EFS_RO_DIR MANIFEST sha256 $(sha256sum < "$EFS_RO_DIR/MANIFEST" | cut -c1-64)"
+fi
 DEADLINE=${DEADLINE:-600} python3 gen_payload.py "$TR" payload
 
 # 3. Host test of the manifest verifier against the real images (+ negatives).
@@ -58,7 +65,20 @@ i = next(k for k, l in enumerate(lines) if l.startswith('F ') and '/system/etc/i
 w('neg-unknown.txt', lines[:i] + lines[i + 1:])
 w('neg-absent.txt', lines + ['A /system/etc/init/hw/init.rc'])
 EOF
-./romram-host-test "$M" "$TR" payload/crownlte/sanitized neg-sha.txt neg-unknown.txt neg-absent.txt > host-test.log
+EFS_ARGS=()
+EL=payload/crownlte/efs-ro/list
+if [ -f "$EL" ]; then
+  # efs-ro: populate + re-check into empty dirs, and a wrong-sha list that must be refused.
+  awk '/^F / && !d { $7 = "0000000000000000000000000000000000000000000000000000000000000000"; d = 1 } 1' \
+    "$EL" > neg-efs-sha.txt
+  EFS_OK=$(mktemp -d efs-host-ok-XXXXXX); EFS_BAD=$(mktemp -d efs-host-bad-XXXXXX)
+  EFS_ARGS=("$EL" payload/crownlte/efs-ro "$EFS_OK" neg-efs-sha.txt "$EFS_BAD")
+fi
+rc=0
+./romram-host-test "$M" "$TR" payload/crownlte/sanitized neg-sha.txt neg-unknown.txt neg-absent.txt \
+  "${EFS_ARGS[@]}" > host-test.log || rc=$?
+if [ -f "$EL" ]; then rm -rf -- "$EFS_OK" "$EFS_BAD"; fi
+if [ $rc != 0 ]; then grep -v '^  log:' host-test.log; exit $rc; fi
 cat host-test.log | grep -v '^  log:'
 
 # 4. Static PID1.
@@ -85,11 +105,14 @@ fi
 chmod 0644 rootfs/crownlte/* rootfs/crownlte/sanitized/*
 chmod 0755 rootfs/crownlte/probe.sh rootfs/crownlte/init_user0.sh rootfs/crownlte rootfs/crownlte/sanitized
 chmod 0444 rootfs/crownlte/empty
+if [ -d rootfs/crownlte/efs-ro ]; then
+  chmod 0700 rootfs/crownlte/efs-ro; chmod 0400 rootfs/crownlte/efs-ro/*
+fi
 find rootfs -exec touch -h -d @0 {} +
 (cd rootfs; find . -mindepth 1 | LC_ALL=C sort | sed 's|^\./||' | (echo .; cat) |
    cpio -o -H newc --reproducible --owner=0:0 2>/dev/null) | gzip -n -9 > diagnostic-initramfs.cpio.gz
 (cd rootfs; find . -type f | LC_ALL=C sort | xargs sha256sum) > rootfs-SHA256SUMS
 sha256sum init.c romram.h romram-sha256.h gen_payload.py templates/* init diagnostic-initramfs.cpio.gz \
-  payload/crownlte/manifest.txt > SHA256SUMS
+  payload/crownlte/manifest.txt $(ls payload/crownlte/efs-ro/list 2>/dev/null) > SHA256SUMS
 cat SHA256SUMS
 echo BUILD-OK

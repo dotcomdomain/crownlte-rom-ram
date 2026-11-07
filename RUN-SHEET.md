@@ -926,3 +926,76 @@ refuses a live TEE (`ROM stage STOPPED stage=tee-must-be-off`), so Lineage and a
 - The storage and sysfs masks are NOT a security boundary against the root adb shell (ADB_ROOT=1). Root in the container can mknod block nodes, clear BLKROSET, unmount masks or mount a fresh sysfs, and so can READ real partitions including EFS. Writes are still refused by the kernel UFS SCSI write guard (the backstop). Acceptable only because the adb session is the operators own diagnostic channel; never treat ADB_ROOT packs as containment for untrusted code.
 - Default-build identity: compare the default builds by rebuilding with ADB unset and running cmp on diagnostic-initramfs.cpio.gz; record both full hashes and the build flags when claiming identity.
 - templates/adb.sh "ESTABLISHED" only means a TCP peer connected, not that adb authenticated. The authenticated PASS is the Windows helper's adb shell check.
+
+## EFS_RO_DIR: read-only RAM copies of selected EFS files (build-only, 2026-11-07)
+
+Why: the B1-hal trial (2026-11-07) showed `android.hardware.bluetooth@1.0-service` aborting with
+"Open: No Bluetooth Address!" because ROM-RAM never mounts EFS, so `/efs/bluetooth/bt_addr` is
+missing. This option is off by default. Builds without it differ only in `init` (unused code) and
+`probe.sh` (an extra block that only runs when the mount exists).
+
+Input: `EFS_RO_DIR=<dir>` holding `MANIFEST` and the files it names. Keep the dir outside git,
+mode 0700. On gekko: `rom-ram/efs-ro/` (bt_addr and wifi.mac.info copied read-only from the phone's 4.9 Lineage).
+
+    D <path under efs, or .> <owner> <group> <mode> [<label>]
+    F <path under efs> <owner> <group> <mode> <sha256> <file in dir> [<label>]
+
+Build time (`gen_payload.py`):
+- Every file must match its sha256 and be 1..4096 bytes. At most 16 entries.
+- `D .` comes first. Each parent needs an earlier D line. Paths are plain names only (no `.`/`..`).
+- Owners come from a fixed AID table. Modes must be <= 0777.
+- An optional label must equal what plat+vendor file_contexts give `/mnt/vendor/efs/<path>`.
+- Refused together with TEE_T2, which mounts a real EFS copy at the same place.
+- Output: `/crownlte/efs-ro/list` plus `f0..fN` (0400 in the cpio), a payload-id suffix, and an
+  `on fs` block appended to init.diag.rc.
+- The host test populates and re-checks the list into an empty directory and must refuse a
+  wrong-sha list. Its temp dirs are deleted.
+- File bytes are never printed.
+
+Boot (PID1, `romram.h` step 5e, before the switch to Lineage init):
+1. Mount a tmpfs at `/mnt/vendor/efs` (64 KiB, 64 inodes, nosuid/nodev/noexec).
+2. Check each payload file's size and sha256, write it with O_EXCL, set owner/group/mode, then
+   re-hash the copy.
+3. Remount read-only (MS_REMOUNT|MS_RDONLY) and require ST_RDONLY.
+4. Re-check every entry (type, owner, mode, sha256).
+5. Log exactly one line: `crownlte-romram: efs-ro: N files, sha ok`.
+
+Any failure stops the ROM stage (`stage=efs-ro-*`), like any other manifest failure. The EFS partition is never opened.
+
+Lineage init:
+- The EFS_RO `on fs` block in init.diag.rc runs first, because init parses this file before its
+  imports. It remounts rw, runs `restorecon_recursive /mnt/vendor/efs` (labels need the loaded
+  policy; labels set before policy load do not survive on tmpfs), then remounts ro.
+- Then the vendor's own `on fs` runs `mount none /mnt/vendor/efs /efs bind`. That line was never
+  disarmed. Until now it failed with ENOENT. Now /efs is the same read-only mount, as on the phone.
+- The vendor's restorecon/chown/chmod/mkdir on efs then find correct labels or fail with EROFS.
+  Harmless.
+- The rw window covers the three commands inside one init action. It is RAM only.
+
+Expected (build-31 EFS set):
+
+| path | owner | mode | label |
+|---|---|---|---|
+| `/mnt/vendor/efs` = `/efs` | radio:system | 0771 | efs_file |
+| `bluetooth/` | system:bluetooth | 0770 | bluetooth_efs_file |
+| `bluetooth/bt_addr` | system:bluetooth | 0640 | bluetooth_efs_file |
+| `wifi/` | wifi:wifi | 0755 | wifi_efs_file |
+| `wifi/.mac.info` | wifi:wifi | 0644 | wifi_efs_file |
+
+PASS lines:
+- K: `crownlte-romram: efs-ro: 2 files, sha ok` (before `exec /system/bin/init`).
+- K: `efs-ro labels restored, /mnt/vendor/efs remount ro issued`.
+- P (probe n=6, ~60 s): `--- efs-ro`, two `tmpfs ... ro,` mount lines (/mnt/vendor/efs and /efs),
+  `ls -laRZ` with the table above, and `efs-ro PASS: /mnt/vendor/efs refuses a new file: ... Read-only file system`.
+- logcat: `get_local_address: Trying /efs/bluetooth/bt_addr` with no "No Bluetooth Address!" and no SIGABRT.
+
+Not PASS:
+- `stage=efs-ro-*` in the STOPPED line.
+- `efs-ro FAIL: ... writable`.
+- An `rw` efs mount line.
+- `restorecon` labels left as `tmpfs`. Check whether the init `mount ... remount` failed in the init log.
+
+Limits:
+- The root adb shell (ADB_ROOT=1) can remount the tmpfs rw. It is RAM only and is gone at the
+  next boot. The UFS SCSI write guard stays the backstop.
+- The MAC values are in the ramdisk (and thus the RECOVERY image). Do not publish those images.

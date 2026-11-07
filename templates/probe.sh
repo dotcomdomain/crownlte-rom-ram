@@ -44,6 +44,18 @@ while true; do
     echo "--- afbc ro.vendor.ddk.set.afbc=$(getprop ro.vendor.ddk.set.afbc)"
     ls -lL /dev/block/persistent 2>&1; ls -l /dev/block/persistent /dev/block/platform/11120000.ufs/by-name 2>&1
   fi
+  # EFS_RO_DIR builds (after on fs): mounts, owners, modes, labels; never contents.
+  if [ $n -eq 6 ] && grep -q ' /mnt/vendor/efs tmpfs ' /proc/mounts; then
+    echo "--- efs-ro"
+    grep -E ' /(mnt/vendor/)?efs ' /proc/mounts
+    ls -laRZ /mnt/vendor/efs 2>&1
+    if msg=$(touch /mnt/vendor/efs/.crownlte-ro-test 2>&1); then
+      rm -f /mnt/vendor/efs/.crownlte-ro-test
+      echo "efs-ro FAIL: /mnt/vendor/efs is writable"
+    else
+      echo "efs-ro PASS: /mnt/vendor/efs refuses a new file: $msg"
+    fi
+  fi
   if [ $((n % 3)) -eq 0 ]; then
     echo "--- ps"
     ps -A -o PID,PPID,S,WCHAN,TIME,NAME 2>&1
