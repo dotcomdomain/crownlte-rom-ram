@@ -802,10 +802,11 @@ reports unavailable; `diagnostic rejects SCSI opcode` on K; is a ratelimited
 lower bound, not a precise counter. Never read trustonic crashdump or active_cpu.
 Do not treat absent EFS-write errors as proof that all daemon paths executed.
 
-## TEE T3: keymaster/gatekeeper TAs through dedicated clients (build-only, 2026-11-06)
+## TEE T3: keymaster/gatekeeper TAs through dedicated clients (build-only, 2026-11-06; review fixes S1/S2 2026-11-07)
 
-Design: `roadmap/tee-t3-design.md`. Report: `src/TEE-T3-REPORT.md`. Kernel `crownlte-tee-3`
-fa72731b5 (blob-pinned guard on 566ee45af); ramdisk branch `tee-t3` on tee-t2 3259275
+Design: `roadmap/tee-t3-design.md`. Report: `src/TEE-T3-REPORT.md` (section "Review fixes S1/S2").
+Kernel `crownlte-tee-3` **22a6b88cc** (registry guard S1 on fa72731b5, blob-pinned guard on 566ee45af);
+ramdisk branch `tee-t3` **452c728** (S2: client pid namespace + fresh /proc, no io_uring) on tee-t2 3259275
 (romram-adb NOT merged). Opt-in: `TEE_T2=1 TEE_T3=<a0|a1|a2|b0|b1> DEADLINE=600 ./build.sh <fresh dir>`.
 Without TEE_T3 the T2 ramdisk is byte-identical (e6c0c93d = T2j build-17, checked) and the default
 ramdisk too (72195507, checked). **Nothing here has run on the phone or an emulator.**
@@ -816,14 +817,19 @@ through the 600 s deadline restart). **T3b-1 sends a TA command and needs its ow
 
 | stage | pack `rom-ram/pack-romram-tee-<stage>/recovery.img` | ramdisk | DTB `exynos9810-crownlte-romram-tee-<stage>.dtb` | what runs |
 |---|---|---|---|---|
-| t3a0 | a76a1c975ce07bfe9abf5f18795e367f0ca6afec2660937072fc906ffae30ace | build-20 aa4a08ed | 91e4ebcc (KM pin) | KM TA open + close |
-| t3a1 | 8f67ef519994a55df7bb650d57e292755713aac89c34361633708f5f57de0ec0 | build-21 bbc7dd61 | 91e4ebcc (same bytes as a0) | KM open + addRngEntropy(32 B) + close |
-| t3a2 | d06b126ea01f12ba2c154a2debe399af240fced45dc944417164fdad3b87b6b1 | build-22 dd4a6d0c | 0fd173cf (KM + sec/TIMA/CM) | daemon -r sec 01, TIMA d..0a, CM d..16; KM open + configure(160000, 202608) + addRngEntropy + close |
-| t3b0 | d831d685767d5b72cfa0d12e83a41c2d6778d72fe4ffca974d4bee67123c33a4 | build-23 7b3bb2cb | 5f637991 (GK pin) | GK TA open + close, no TCI command |
-| **t3b1** | 9e7e2d38c5b67436e7f653fc58749e7d8cba8a0b3fd6ef416e79d7d2fb94443b | build-24 8c380f63 | 1a40fcf7 (GK + CM) | **SEPARATE GO.** daemon -r CM d..16; GK open + **ONE verify** (fake uid 0x7ffffff0) + close |
+| t3a0 | b1c0667c219979d29f493f2500f441eb510c503bc34921adba701a7626bed8d4 | build-25 718c8a2d | 91e4ebcc (KM pin) | KM TA open + close |
+| t3a1 | 831cebe48bf8c85ea7b0048d6780c070e3efa695c581c56cd68eace25d09a6d2 | build-26 2fd18c0f | 91e4ebcc (same bytes as a0) | KM open + addRngEntropy(32 B) + close |
+| t3a2 | a5fcf993b91da1803c8177a1fa55dff666e991226776f0ff0a31fa869e8cb5fd | build-27 e7473701 | 0fd173cf (KM + sec/TIMA/CM) | daemon -r sec 01, TIMA d..0a, CM d..16; KM open + configure(160000, 202608) + addRngEntropy + close |
+| t3b0 | d15283a53893dbe81cff8dbc9688cfc74e737a90837a116f8daf59af9df75e6f | build-28 7a57eebb | 5f637991 (GK pin) | GK TA open + close, no TCI command |
+| **t3b1** | bc96070a1699ec9f5fa1be71b2a16f46dba50d1b7e1e0ec574014604f394c4b4 | build-29 23caa24f | 1a40fcf7 (GK + CM) | **SEPARATE GO.** daemon -r CM d..16; GK open + **ONE verify** (fake uid 0x7ffffff0) + close |
 
-Common: Image a466abe215a07834072cd4188c0f18a16180359ef22e15d61a13b9655ea60334
-(`panel-bright-work/ko-tee-t3pin`), shim bbea9590, parent a8198be0, restore 8763860c (as T2j).
+Common: Image e4a5a04e36fcd7bb57111619f9f2304f0997f99f65127fd52d859fe5059e0669
+(`panel-bright-work/ko-tee-t3s1`), shim bbea9590, parent a8198be0, restore 8763860c (as T2j).
+The superseded packs (Image a466abe2; recovery a76a1c97 / 8f67ef51 / d06b126e / d831d685 / 9e7e2d38) are
+gone and must not be used. **T2j was repacked with the same Image**:
+`rom-ram/pack-romram-tee-t2j/recovery.img` 8f68d8439dda6f8308ddb75a55f70873bb449d6a6d3e931284fb64ce85e03982
+(ramdisk build-17 e6c0c93d, DTB tee-t3dbg 06a6cf36; was 8f5f1a31 with Image dabc09eb). Its expected lines are
+the T2 ones plus the `open-session-registry ... SWd selection only` lines below.
 All DTBs = tee-t3dbg 06a6cf36 + only the stage's `samsung,tee-trustlet-allow` /
 `samsung,tee-driver-allow` (decompile diff + pin re-derivation: `t3-tools/verify-dtb.py` PASS).
 
@@ -839,7 +845,8 @@ K; (kernel / PID1):
 - `masked dir /rom/dev/bsg`
 - a2: three `tee session-guard: admin-load-driver uuid=<01|0a|16> type=1 len=<16013|377173|23697> sha256=... by mcDriverDaemon[N]: allowed`; b1: one (d..16, len 23697)
 - `tee session-guard: open-trustlet uuid=<KM|GK> type=3 len=<767845|10741> sha256=<pin> by crownlte-t3-<km|gk>[N]: allowed`
-- No `REFUSED (...)` line for open-trustlet / admin-load-*. Any `open-session ... REFUSED` is reported (as in T2), not fatal.
+- `tee session-guard: open-session-registry uuid=07050501000000000000000000000020 gp=0 by <comm>[N]: SWd selection only (no pin, daemon not asked)` (and the same for `08050500000000000000000000000000`) whenever the daemon opens FSD2 / DebugSession, each right after the usual `open-session uuid=... : allowed` line. The daemon is no longer asked for these blobs (S1).
+- No `REFUSED (...)` line for open-trustlet / admin-load-* / open-session-registry / gp-open-session-registry (all fatal). Any `open-session ... REFUSED` is reported (as in T2), not fatal.
 
 P; (all prefixed `T3 `):
 - `T3 stage <s> start; software keymaster/HAL masks retained container-wide`
@@ -851,7 +858,8 @@ P; (all prefixed `T3 `):
 - `T3 logcat ... TEE is ready ...`; `T3 daemon ready=1 driver_loads_allowed=<n> (want <n>) blob_refusals=0 session_refusals=<n>`
 - `T3 vendor.sys.mobicoredaemon.enable=true (set by daemon)` or the runner line `... (set by runner)`
 - `T3 user node M:m private to this namespace`; `T3 verified /vendor/lib64/...` (4 libs for KM, libMcClient for GK)
-- `T3 client exec /vendor/bin/crownlte-t3-<km|gk> <s> uid=1000 groups=drmrpc seccomp=client(88 insns)`
+- `T3 client pid namespace: runner pid 1, fresh /proc (1 proc mount, hidepid=invisible, only pid 1; cmdline substituted, sysrq-trigger masked)`
+- `T3 client exec /vendor/bin/crownlte-t3-<km|gk> <s> uid=1000 groups=drmrpc pid=2 seccomp=client(123 insns)`
 - KM (a*): `T3 km client start stage=a<n> uid=1000 gid=1000`, `T3 km module id=keystore name=Keymaster MDFPP Mobicore HAL ...`,
   `T3 tee mcOpenDevice id=0 rc=0x0`, `T3 tee mcOpenTrustlet spid=0xfffffffe len=767845 tci_len=16 rc=0x0 sid=<n>`, `T3 tee mcMap ... rc=0x0` (x2),
   `T3 km open rc=0 dev=yes trustlet_opens=1`;
@@ -880,6 +888,9 @@ Not PASS: any `T3 FAIL ...`, `T3 RESULT ... FAIL`, a `REFUSED (...)` blob line, 
 - `T3 FAIL pin counts ...` / `DT ... does not match stage` / `kernel has no blob guard`: wrong DTB/Image for this ramdisk. Nothing started.
 - `T3 FAIL km property mismatch ...` (a2): the container properties are not 16 / 2026-08-01. No TEE call made.
 - `T3 FAIL km dlopen ...` / `T3 FAIL dlopen libMcClient.so` / client exit 127: vendor linker namespace or the custom bionic start-up did not work (untested on hardware). No TEE call made.
+- `T3 FAIL umount old /proc ...` / `T3 FAIL mount fresh /proc ...` / `T3 FAIL fresh /proc: ...` / `T3 FAIL client pid namespace ...` / `T3 FAIL client drop/seccomp ...`, each followed by `client NOT started` (S2): the phone (SELinux domain of the runner, mount policy) refused the client pid namespace or its procfs, or the check found another proc mount / foreign pid. The client did not run and made no TEE call. Do not work around it by dropping the isolation; report the line.
+- `tee session-guard: open-session-registry uuid=... REFUSED (...)` (S1, fatal via blob_refusals): the kernel was asked to map a daemon blob for a pinned UUID and it did not match. Not expected in any T2j/T3 stage, where no allowed session UUID is pinned.
+- FSD2/DebugSession not starting although `open-session-registry ... SWd selection only` is logged: the SWd refused selection of its built-in. Compare with the T2j logs from before the repack, if any exist.
 - `[WRN]Property vendor.sys.mobicoredaemon.enable is different...` (logcat) + `T3 km open rc=-...`: property not visible to the HAL.
 - `open-trustlet ... REFUSED (sha256 mismatch|uuid not pinned|service type)`: the kernel guard refused a blob (vendor image changed or wrong DTB).
 - a0/a1: TIMA/CryptoManager errors in TA logs are expected without drivers. a1 `add_rng_entropy rc=-<n>` may mean the TA wants configure first (then a2 answers it).

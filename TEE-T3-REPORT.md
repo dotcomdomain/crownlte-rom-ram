@@ -5,6 +5,119 @@ excluded sandbox/VM access. Scratch in /dev/shm, kernel -j3 foreground with LLVM
 Design followed: `roadmap/tee-t3-design.md` (T3a-0/1/2, T3b-0/1). Run sheet: section
 "TEE T3" in `src/RUN-SHEET.md` (also appended to `rom-ram/RUN-SHEET.md`).
 
+## Review fixes S1/S2 (2026-11-07) — supersede the Image, ramdisks and packs below
+
+Two review blockers fixed. Kernel `crownlte-tee-3` **22a6b88cc** (on fa72731b5), ramdisk
+branch `tee-t3` **452c728** (on 334746b). The DTBs are unchanged (no DT change needed).
+The sections further down describe the first T3 build. Where they give an Image, ramdisk,
+tee-t3-run or pack hash, the table at the end of this section replaces it.
+
+**S1 (kernel): OPEN_SESSION / GP open-session mapped unchecked daemon bytes.** The UUID
+allow list checked only the *requested* UUID. `tee_object_get()` then took whatever the
+daemon returned for GET_TRUSTLET (another signed blob, an SP object) and mapped it. With
+the session guard on, the object now comes from `mc_registry_object()` (new
+`registry_guard.h`), called after the UUID allow list:
+- UUID **with** a pin in `samsung,tee-trustlet-allow`: the daemon bytes are taken only if they
+  are a plain MCLF system trustlet (no SP object, no driver type), the header UUID equals the
+  *requested* UUID (new verdict `uuid not the requested uuid`), and SHA-256 matches a pin for
+  that UUID. A fetch error is returned as is, with no fallback to SWd selection.
+- UUID **without** a pin (FSD2 07050501..20, DebugSession 08050500..00, i.e. every T2/T3 DTB):
+  **SWd selection only** (`tee_object_select`, a bare header with the UUID). The daemon is
+  never asked. Without TA-auth support the request is refused.
+- Without `samsung,tee-session-guard`: same code path as before (registry, then SWd
+  selection on ENOENT). open-trustlet and LOAD_DRIVER: unchanged (`want_uuid` NULL).
+- Logs: `tee session-guard: open-session-registry|gp-open-session-registry uuid=.. gp=.. by
+  comm[pid]: SWd selection only (no pin, daemon not asked)`, or `... type= len= sha256= ...:
+  allowed`, or `... blob_uuid=.. ...: REFUSED (<reason>)` / `REFUSED (registry fetch error N)`.
+- Behaviour change for T2j/T3: FSD2/DebugSession were already SWd built-ins. The daemon has
+  no `07050501...20` / `08050500...00` file in `/vendor/app/mcRegistry` and the /data registries
+  are empty tmpfs, so before this fix the daemon answered ENOENT and the kernel fell back to
+  SWd selection. That is inferred, not observed: no phone log of these opens exists. The only
+  difference now is that the daemon is not asked at all.
+- `tests/blob-guard-fixture.c` drives `mc_registry_object()` itself, with a stub daemon
+  (`tee_object_get`) and a stub SWd selection that count calls, allocations and frees. It
+  covers valid KM/GK blobs (legacy and GP), another pinned and correctly signed blob for the
+  wrong UUID, a KM body carrying the GK UUID, byte flips, ±1 length, bad magic, retyped SP or
+  driver, a driver blob, the SP object, 75/0-byte blobs, daemon ENOENT/EPIPE (no fallback),
+  and unpinned FSD2/DebugSession/KM. In the unpinned cases the daemon must not be called,
+  even though it would have answered with a valid KM blob. Also no TA auth. Result:
+  **`blob guard fixture: PASS (77 checks, 0 failures)`**, clean under ASan/UBSan. Mutations:
+  without the requested-UUID check 3 checks fail; with the pin-based source choice removed,
+  7 fail.
+- Build: clang FORTIFY_SOURCE could not bound the new pin loop, so the loop now also stops
+  at `MC_PIN_MAX`. Image **e4a5a04e36fcd7bb57111619f9f2304f0997f99f65127fd52d859fe5059e0669**
+  (incremental `/dev/shm/build-tee3`, -j3, no warnings), copied to
+  `panel-bright-work/ko-tee-t3s1` with the unchanged DTBs.
+
+**S2 (ramdisk): socket rule bypass through io_uring; other processes visible in /proc.**
+- Client filter (123 insns, was 88): `io_uring_setup/enter/register` -> ENOSYS. These are
+  the IORING_OP_SOCKET path that never runs the filtered `socket()`. Also `clone3` -> ENOSYS,
+  `clone` with any CLONE_NEW* flag -> EPERM (fork, threads and vfork pass), and
+  `process_vm_readv`, `pidfd_open`, `pidfd_getfd` plus the new mount API (`open_tree`,
+  `move_mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `mount_setattr`) -> EPERM.
+- Daemon filter (42/44 insns): io_uring -> ENOSYS too. mcDriverDaemon, libMcClient and the
+  keymaster libraries import neither `syscall` nor io_uring symbols. The pinned bionic
+  `libc.so` has no `svc` with 425-427 or 435.
+- Client `/proc`: the client now runs in its **own pid namespace**. Its pid 1 is the runner
+  (root, not dumpable). In the private client mount namespace, pid 1 detaches the container
+  `/proc` (hidepid=2,gid=3009, which shows every uid 1000 process) and mounts a procfs of the
+  new pid namespace with `hidepid=invisible` and no readproc gid. It then re-applies the
+  container masks (substituted `/proc/cmdline`, empty `sysrq-trigger`/`bootconfig`) and checks
+  mountinfo: exactly one proc mount, at `/proc`, `hidepid=invisible`, and only pid 1 listed.
+  The client runs as **pid 2**, so `alarm()` and default signals still work. pid 1 reaps it
+  and passes the status on, and if pid 1 dies the kernel kills the namespace. Any failure:
+  `T3 FAIL ...; client NOT started`.
+- `t3-seccomp-fixture`: io_uring ENOSYS for the daemon (both variants) and the client, clone3,
+  clone with CLONE_NEW* flags vs fork/pthread/vfork flags, and the new deny entries:
+  **`PASS (0 failures; insns daemon=42 daemon+drv=44 client=123; 2^24 'M' cmds x3)`**. Without
+  the client io_uring rule, 6 checks fail.
+- New `t3-pidns-fixture` (run by build.sh as root under `unshare --mount --propagation private`;
+  the fixture also makes its own namespace MS_PRIVATE). It runs the runner's own
+  `client_pidns()` with a uid 1000 probe, plus a dumpable uid 1000 sleeper outside the
+  namespace as the alias target. Control: **without** isolation `/proc/<sleeper>/root` is
+  reachable, so the alias exists on this host. **With** isolation the probe is pid 2, sees only
+  its own pid, no `/proc/1`, no `/proc/<sleeper>` or its `root`, one proc mount with
+  `hidepid=invisible`, and a masked `sysrq-trigger`. `/proc/self/exe` and `/proc/self/status`
+  still work, as the bionic linker and the HAL need. Exit status 7 and a default SIGALRM pass
+  through pid 1. **`t3 pidns fixture: PASS`** in every build. With the pid namespace removed,
+  the probe fails 8 checks. The host `/proc` was checked unchanged afterwards.
+- Template: `open-session-registry` / `gp-open-session-registry` refusals count as fatal blob
+  refusals.
+- Regression: `TEE_T2=1` without TEE_T3 = e6c0c93d and default = 72195507, both still
+  byte-identical.
+
+**T2j repacked** with the S1 Image (same ramdisk build-17 e6c0c93d, same DTB tee-t3dbg 06a6cf36):
+FSD2/DebugSession now by SWd selection only.
+
+| pack | ramdisk (rom-ram/build-N) | tee-t3-run | DTB | recovery.img |
+|---|---|---|---|---|
+| t3a0 | build-25 718c8a2df77709bb66f1a56ad90858da95ed7f2389e922a2b45c743977223aa7 | e35c9001... | 91e4ebcc | b1c0667c219979d29f493f2500f441eb510c503bc34921adba701a7626bed8d4 |
+| t3a1 | build-26 2fd18c0fd512e39ad271b6a4785653d75bda4ad5bd0a21a0374b0daf7ba7c782 | f8e7cc86... | 91e4ebcc | 831cebe48bf8c85ea7b0048d6780c070e3efa695c581c56cd68eace25d09a6d2 |
+| t3a2 | build-27 e747370157ec1db3d57f21b1a34cf33c09ea548d6a56da4c42f6e27f8f92c805 | fd4ee611... | 0fd173cf | a5fcf993b91da1803c8177a1fa55dff666e991226776f0ff0a31fa869e8cb5fd |
+| t3b0 | build-28 7a57eebb8b3ee7d2790c35db1a5f707c98c567586b354638c2ddd375c467d3e6 | 4b9f6b97... | 5f637991 | d15283a53893dbe81cff8dbc9688cfc74e737a90837a116f8daf59af9df75e6f |
+| t3b1 | build-29 23caa24f6ee6f36b019f4d8be9ae3ef3b489e1686872e030c1f65f66925d9821 | e93db0bd... | 1a40fcf7 | bc96070a1699ec9f5fa1be71b2a16f46dba50d1b7e1e0ec574014604f394c4b4 |
+| t2j | build-17 e6c0c93d2a4249e1252922a61d16a99b523cfb89fb608227357ec8daf5023dc9 | (T2 runner) | 06a6cf36 | 8f68d8439dda6f8308ddb75a55f70873bb449d6a6d3e931284fb64ce85e03982 |
+
+All six: Image e4a5a04e, shim bbea9590, parent a8198be0, restore 8763860c. The clients are
+unchanged (km 41a08643..., gk b8aee112...). The packs were rebuilt in place by
+`t3-tools/pack-t3.sh`. Each old pack was removed only after its manifest showed the expected
+old Image (a466abe2 / dabc09eb). Superseded recovery images: t3a0 a76a1c97, t3a1 8f67ef51,
+t3a2 d06b126e, t3b0 d831d685, t3b1 9e7e2d38, t2j 8f5f1a31. Their inputs are still on disk
+(ko-tee-t3pin, ko-tee-t3, build-17, build-20..24). shim-src worktrees and shim-out were removed.
+
+Still untested after S1/S2 (in addition to the list at the end):
+- Kernel registry path at runtime: the fixture runs the real decision function, but the
+  `client.c` wiring, `mc_guard_registry_object()` logging and `g_ctx.f_ta_auth` on this SWd
+  are only compiled. If FSD2/DebugSession fail to start now, look for the
+  `open-session-registry ... SWd selection only` line and the daemon's FSD2 log.
+- Client pid namespace on the phone: `unshare(CLONE_NEWPID)`, the procfs mount with
+  `hidepid=invisible` and the binds onto `/proc/cmdline` and `/proc/sysrq-trigger` under the
+  container's SELinux domain for the runner, and strace -f across the new pid namespace. All
+  of this was tested on gekko only (x86, no SELinux enforcement on that path). If the phone
+  refuses any step, the client is not started (`T3 FAIL ... client NOT started`).
+- Whether anything in the vendor HAL path needs other processes' `/proc` entries (none
+  expected; `/proc/self` works).
+
 ## What was built
 
 **Kernel** `crownlte-tee-3` **fa72731b5** "blob-pinned guard for open-trustlet and admin
