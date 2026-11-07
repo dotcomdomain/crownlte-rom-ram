@@ -641,6 +641,10 @@ static void timer_start_failed(int error)
 #define UFS_READY "CROWNLTE-UFS-READY-1\n"
 #define UFS_PROBE "CROWNLTE-UFS-PROBE-1\n"
 #define ROM_START "CROWNLTE-ROMRAM-START-1\n"
+/* After START (or after the stage was disabled): exactly this frame asks for
+ * an early default restart, the same reboot(RB_AUTOBOOT) the deadline uses.
+ * Any other byte only resets the match; the deadline stays the safety net. */
+#define ROM_DONE "CROWNLTE-ROMRAM-DONE-1\n"
 #define UFS_SNAPSHOT "UFS readiness snapshot complete; probe remains held"
 struct ufs_handshake {
         int ready, failed, requested, attempted, start_requested, input_done;
@@ -649,6 +653,8 @@ struct ufs_handshake {
         char line[64];
         pid_t child;
         int reaped, wait_error, probe_status_ok;
+        int done_requested;
+        size_t done_len;
 };
 
 static void ufs_fail(struct ufs_handshake *state, const char *reason, int error)
@@ -659,10 +665,24 @@ static void ufs_fail(struct ufs_handshake *state, const char *reason, int error)
         }
 }
 
+static void done_input(struct ufs_handshake *state, const char *input, size_t n)
+{
+        for (size_t i = 0; i < n && !state->done_requested; i++) {
+                if (input[i] != ROM_DONE[state->done_len]) {
+                        state->done_len = input[i] == ROM_DONE[0] ? 1 : 0;
+                        continue;
+                }
+                if (++state->done_len == strlen(ROM_DONE))
+                        state->done_requested = 1;
+        }
+}
+
 static void ufs_input(struct ufs_handshake *state, const char *input, size_t n)
 {
-        if (state->failed || state->input_done)
+        if (state->failed || state->input_done) {
+                done_input(state, input, n);
                 return;
+        }
         for (size_t i = 0; i < n; i++) {
                 const char *expected = !state->ready ? UFS_READY :
                                        !state->requested ? UFS_PROBE : ROM_START;
@@ -699,9 +719,15 @@ static void ufs_input_poll(struct ufs_handshake *state, int serial)
 {
         char input[64];
         ssize_t n;
-        if (serial < 0 || state->failed || state->input_done)
+        if (serial < 0 || state->done_requested)
                 return;
         n = read(serial, input, sizeof(input));
+        if ((state->failed || state->input_done) && n > 0) {
+                done_input(state, input, n);	/* only the DONE frame counts now */
+                return;
+        }
+        if (state->failed || state->input_done)
+                return;	/* read errors after START are not stage failures */
         if (n > 0)
                 ufs_input(state, input, n);
         else if (n < 0 && errno != EAGAIN && errno != EINTR)
@@ -1050,6 +1076,15 @@ int main(void)
                         sent = 0;
                 }
                 ufs_input_poll(&ufs, serial);
+                if (ufs.done_requested == 1) {
+                        int result, error;
+
+                        ufs.done_requested = 2;	/* one attempt; the deadline stays armed */
+                        announce("host DONE frame accepted after %llu ms; early default restart", now);
+                        result = reboot(RB_AUTOBOOT);
+                        error = result ? errno : 0;
+                        announce("early restart returned result=%d errno=%d; deadline restart still armed", result, error);
+                }
                 /* Drain the 128 KiB printk ring fast; Lineage init is chatty. */
                 for (int i = 0; i < 4096 && reader >= 0; i++) {
                         n = read(reader, record, sizeof(record));

@@ -408,6 +408,9 @@ on post-fs-data
     setprop service.adb.tcp.port 5555
     setprop persist.sys.usb.config adb
     start crownlte_adb
+''' + ('''    # ADB_ROOT=1: Lineage gates adb root on its root-access setting (2 = ADB only)
+    setprop persist.sys.root_access 2
+''' if ADB_ROOT else '') + '''
 
 # sys.usb.config=none (UsbDeviceManager switching functions) stops adbd; start
 # it again so TCP adb survives. adbd's own restarts (adb root) are "restarting".
