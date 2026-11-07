@@ -16,7 +16,8 @@
  *   daemon             T2 daemon (private user node, uid 1000, no_new_privs,
  *                      seccomp) plus -r preloads of exactly the pinned drivers
  *                      of this stage; LOAD_DRIVER allowed only then.
- *   client             private mount namespace for the stage client, then
+ *   client             private mount namespace for the stage client, own pid
+ *                      namespace + fresh /proc (hidepid=invisible), then pid 2:
  *                      uid 1000 + seccomp + exec of the client.
  *
  * Every line on stdout starts with "T3 " (stdout is /dev/crownlte/probe.txt).
@@ -84,6 +85,39 @@
 #define T3_NR_finit_module	273
 #define T3_NR_bpf		280
 #define T3_NR_kexec_file_load	294
+#define T3_NR_clone		220
+#define T3_NR_process_vm_readv	270
+#define T3_NR_io_uring_setup	425
+#define T3_NR_io_uring_enter	426
+#define T3_NR_io_uring_register	427
+#define T3_NR_open_tree		428
+#define T3_NR_move_mount	429
+#define T3_NR_fsopen		430
+#define T3_NR_fsconfig		431
+#define T3_NR_fsmount		432
+#define T3_NR_fspick		433
+#define T3_NR_pidfd_open	434
+#define T3_NR_clone3		435
+#define T3_NR_pidfd_getfd	438
+#define T3_NR_mount_setattr	442
+/* clone() flags that create namespaces (CLONE_NEWNS|NEWCGROUP|NEWUTS|NEWIPC|
+ * NEWUSER|NEWPID|NEWNET); clone() only takes the low 32 bits. */
+#define T3_CLONE_NEWNS_ANY	0x7e020000u
+#ifdef __aarch64__
+_Static_assert(T3_NR_clone == __NR_clone && T3_NR_clone3 == __NR_clone3 &&
+	       T3_NR_process_vm_readv == __NR_process_vm_readv &&
+	       T3_NR_io_uring_setup == __NR_io_uring_setup &&
+	       T3_NR_io_uring_enter == __NR_io_uring_enter &&
+	       T3_NR_io_uring_register == __NR_io_uring_register &&
+	       T3_NR_open_tree == __NR_open_tree && T3_NR_move_mount == __NR_move_mount &&
+	       T3_NR_fsopen == __NR_fsopen && T3_NR_fsconfig == __NR_fsconfig &&
+	       T3_NR_fsmount == __NR_fsmount && T3_NR_fspick == __NR_fspick &&
+	       T3_NR_pidfd_open == __NR_pidfd_open && T3_NR_pidfd_getfd == __NR_pidfd_getfd &&
+	       T3_NR_mount_setattr == __NR_mount_setattr,
+	       "aarch64 syscall numbers (T3 S2)");
+_Static_assert(T3_CLONE_NEWNS_ANY == (CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC |
+				      CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET), "clone ns flags");
+#endif
 #ifdef __aarch64__
 _Static_assert(T3_NR_ioctl == __NR_ioctl && T3_NR_socket == __NR_socket &&
 	       T3_NR_mount == __NR_mount && T3_NR_umount2 == __NR_umount2 &&
@@ -322,7 +356,7 @@ static int no_scsi_passthrough(void)
 
 /* ------------------------------------------------------------ seccomp */
 struct t3_prog {
-	struct sock_filter f[128];
+	struct sock_filter f[256];
 	unsigned n;
 };
 static void ins(struct t3_prog *p, unsigned short code, unsigned k, unsigned char jt, unsigned char jf)
@@ -377,8 +411,20 @@ static void mc_ioctls(struct t3_prog *p, const unsigned *allow, unsigned n)
 	ret(p, SECCOMP_RET_ALLOW);
 }
 
+/* io_uring would run socket/file operations without the filtered syscalls
+ * (IORING_OP_SOCKET etc.): ENOSYS, as on a kernel without io_uring. Neither
+ * the vendor daemon/HAL libraries nor bionic use it (no syscall() import, no
+ * svc with these numbers). */
+static void no_io_uring(struct t3_prog *p)
+{
+	ld(p, offsetof(struct seccomp_data, nr));
+	if_eq_ret(p, T3_NR_io_uring_setup, SECCOMP_RET_ERRNO | ENOSYS);
+	if_eq_ret(p, T3_NR_io_uring_enter, SECCOMP_RET_ERRNO | ENOSYS);
+	if_eq_ret(p, T3_NR_io_uring_register, SECCOMP_RET_ERRNO | ENOSYS);
+}
+
 /* Daemon: the T2 v3 list; LOAD_DRIVER only in stages with pinned drivers.
- * LOAD_CHECK, OPEN_TRUSTLET and all GP_* stay refused. */
+ * LOAD_CHECK, OPEN_TRUSTLET and all GP_* stay refused. No io_uring. */
 static int build_daemon_filter(struct t3_prog *p, int load_driver)
 {
 	unsigned allow[16] = {MC_GET_DRIVER_REQUEST, MC_GET_INFO, MC_LOAD_TOKEN, MC_VERSION,
@@ -394,13 +440,17 @@ static int build_daemon_filter(struct t3_prog *p, int load_driver)
 	mc_ioctls(p, allow, n);
 	if (end_nr(p, at))
 		return -1;
+	no_io_uring(p);
 	ret(p, SECCOMP_RET_ALLOW);
 	return p->n <= sizeof(p->f) / sizeof(p->f[0]) ? 0 : -1;
 }
 
 /* Client: user-node session ioctls only (no OPEN_SESSION, no GP, no admin);
- * sockets only AF_UNIX/SOCK_DGRAM (liblog); no mount/ptrace/namespace/module/
- * key/bpf/mknod syscalls. execve stays possible for the one exec of the
+ * sockets only AF_UNIX/SOCK_DGRAM (liblog), and no io_uring (ENOSYS), which
+ * could open sockets without socket(); no mount (old and new API)/ptrace/
+ * namespace (unshare, setns, clone with CLONE_NEW*, clone3 -> ENOSYS)/
+ * module/key/bpf/mknod/cross-process memory or fd (process_vm_*, pidfd_open,
+ * pidfd_getfd) syscalls. execve stays possible for the one exec of the
  * client; the client then adds its own no-exec layer (t3-bionic.h). */
 static int build_client_filter(struct t3_prog *p)
 {
@@ -412,7 +462,9 @@ static int build_client_filter(struct t3_prog *p)
 		T3_NR_delete_module, T3_NR_kexec_load, T3_NR_kexec_file_load, T3_NR_reboot,
 		T3_NR_swapon, T3_NR_swapoff, T3_NR_perf_event_open, T3_NR_process_vm_writev,
 		T3_NR_open_by_handle_at, T3_NR_socketpair, T3_NR_keyctl, T3_NR_add_key,
-		T3_NR_request_key, T3_NR_mknodat,
+		T3_NR_request_key, T3_NR_mknodat, T3_NR_process_vm_readv, T3_NR_pidfd_open,
+		T3_NR_pidfd_getfd, T3_NR_open_tree, T3_NR_move_mount, T3_NR_fsopen,
+		T3_NR_fsconfig, T3_NR_fsmount, T3_NR_fspick, T3_NR_mount_setattr,
 	};
 	unsigned at;
 
@@ -432,16 +484,26 @@ static int build_client_filter(struct t3_prog *p)
 	ret(p, SECCOMP_RET_ERRNO | EPERM);
 	if (end_nr(p, at))
 		return -1;
-	ld(p, offsetof(struct seccomp_data, nr));
+	/* fork/threads yes, new namespaces no */
+	at = begin_nr(p, T3_NR_clone);
+	ld(p, offsetof(struct seccomp_data, args[0]));	/* low 32 bits (LE) */
+	ins(p, BPF_ALU | BPF_AND | BPF_K, T3_CLONE_NEWNS_ANY, 0, 0);
+	if_eq_ret(p, 0, SECCOMP_RET_ALLOW);
+	ret(p, SECCOMP_RET_ERRNO | EPERM);
+	if (end_nr(p, at))
+		return -1;
+	no_io_uring(p);
+	/* clone3 flags are behind a pointer: ENOSYS (bionic does not use clone3) */
+	if_eq_ret(p, T3_NR_clone3, SECCOMP_RET_ERRNO | ENOSYS);
 	for (unsigned i = 0; i < sizeof(deny) / sizeof(deny[0]); i++)
 		if_eq_ret(p, deny[i], SECCOMP_RET_ERRNO | EPERM);
 	ret(p, SECCOMP_RET_ALLOW);
 	return p->n <= sizeof(p->f) / sizeof(p->f[0]) ? 0 : -1;
 }
 
-static int install(struct t3_prog *p)
+static int install(const struct t3_prog *p)
 {
-	struct sock_fprog prog = {(unsigned short)p->n, p->f};
+	struct sock_fprog prog = {(unsigned short)p->n, (struct sock_filter *)p->f};
 
 	return prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog);
 }
@@ -626,6 +688,154 @@ static int do_daemon(void)
 	return 127;
 }
 
+static int child_status(pid_t pid)
+{
+	int status;
+
+	while (waitpid(pid, &status, 0) < 0)
+		if (errno != EINTR)
+			return 125;
+	if (WIFEXITED(status))
+		return WEXITSTATUS(status);
+	if (WIFSIGNALED(status))
+		return 128 + WTERMSIG(status);
+	return 125;
+}
+
+/*
+ * Pid 1 of the client pid namespace, in the client mount namespace (made
+ * MS_PRIVATE by private_user_node, so nothing propagates out): replace /proc
+ * by a procfs of this pid namespace with hidepid=invisible (and no gid=3009
+ * readproc exception). The container's /proc masks (romram.h step 5b) are
+ * re-applied: substituted /proc/cmdline, empty /proc/sysrq-trigger and
+ * /proc/bootconfig. Then prove it: exactly one proc mount in this namespace,
+ * at /proc, hidepid=invisible, and the only pid it lists is 1. Other
+ * processes (and their /proc/<pid>/root, fd/, ns/ aliases into other
+ * namespaces) do not exist here.
+ */
+static int fresh_proc(const char *empty)
+{
+	char *line = NULL;
+	size_t cap = 0;
+	FILE *f;
+	DIR *d;
+	struct dirent *e;
+	int procs = 0, at_proc = 0, hide = 0, pids = 0, bad = 0;
+
+	if (getpid() != 1)
+		return T3("FAIL client pid namespace: pid %d, not 1\n", (int)getpid()), -1;
+	if (umount2("/proc", MNT_DETACH))
+		return T3("FAIL umount old /proc errno=%d\n", errno), -1;
+	if (mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, "hidepid=invisible"))
+		return T3("FAIL mount fresh /proc errno=%d\n", errno), -1;
+	if (!access("/dev/crownlte/cmdline", F_OK) && bind_ro("/dev/crownlte/cmdline", "/proc/cmdline"))
+		return T3("FAIL fresh /proc: cmdline substitution errno=%d\n", errno), -1;
+	if (bind_ro(empty, "/proc/sysrq-trigger"))
+		return T3("FAIL fresh /proc: sysrq-trigger mask errno=%d\n", errno), -1;
+	if (!access("/proc/bootconfig", F_OK) && bind_ro(empty, "/proc/bootconfig"))
+		return T3("FAIL fresh /proc: bootconfig mask errno=%d\n", errno), -1;
+	f = fopen("/proc/self/mountinfo", "re");
+	if (!f)
+		return T3("FAIL fresh /proc: no mountinfo errno=%d\n", errno), -1;
+	while (getline(&line, &cap, f) > 0) {
+		char mp[512], fstype[64], opts[512];
+		const char *sep = strstr(line, " - ");
+
+		if (!sep || sscanf(line, "%*s %*s %*s %*s %511s", mp) != 1 ||
+		    sscanf(sep + 3, "%63s %*s %511s", fstype, opts) != 2) {
+			bad++;
+			continue;
+		}
+		if (strcmp(fstype, "proc"))
+			continue;
+		procs++;
+		if (!strcmp(mp, "/proc")) {
+			at_proc++;
+			hide += strstr(opts, "hidepid=invisible") != NULL;
+		}
+	}
+	free(line);
+	fclose(f);
+	d = opendir("/proc");
+	if (!d)
+		return T3("FAIL fresh /proc: opendir errno=%d\n", errno), -1;
+	while ((e = readdir(d))) {
+		if (e->d_name[0] < '0' || e->d_name[0] > '9')
+			continue;
+		pids++;
+		if (strcmp(e->d_name, "1"))
+			bad++;
+	}
+	closedir(d);
+	if (bad || procs != 1 || at_proc != 1 || hide != 1 || pids != 1) {
+		T3("FAIL fresh /proc: proc mounts=%d at /proc=%d hidepid=%d pids=%d unparsed/foreign=%d\n",
+		   procs, at_proc, hide, pids, bad);
+		return -1;
+	}
+	T3("client pid namespace: runner pid 1, fresh /proc (1 proc mount, hidepid=invisible, only pid 1; "
+	   "cmdline %s, sysrq-trigger masked)\n",
+	   access("/dev/crownlte/cmdline", F_OK) ? "kernel's (no substitute)" : "substituted");
+	return 0;
+}
+
+/*
+ * The client runs as pid 2 of a new pid namespace whose pid 1 is this runner
+ * (root, not dumpable, invisible to uid 1000 through hidepid). pid 1 only
+ * reaps; the client is not pid 1, so its alarm()/default signals still work.
+ * When pid 1 exits, the kernel kills the whole namespace.
+ */
+static int client_pidns(const char *target, const char *argv0, const char *arg,
+			const struct t3_prog *p, const char *empty)
+{
+	static const gid_t drmrpc[] = {1026};
+	pid_t init, client;
+
+	if (unshare(CLONE_NEWPID)) {
+		T3("FAIL client pid namespace errno=%d; client NOT started\n", errno);
+		return 124;
+	}
+	fflush(stdout);
+	fflush(stderr);
+	init = fork();
+	if (init < 0) {
+		T3("FAIL fork pid 1 errno=%d; client NOT started\n", errno);
+		return 124;
+	}
+	if (init)
+		return child_status(init);
+
+	/* pid 1 of the client pid namespace */
+	if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) || prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) ||
+	    fresh_proc(empty)) {
+		T3("FAIL client pid namespace setup; client NOT started\n");
+		fflush(stdout);
+		_exit(124);
+	}
+	fflush(stdout);
+	fflush(stderr);
+	client = fork();
+	if (client < 0) {
+		T3("FAIL fork client errno=%d; client NOT started\n", errno);
+		fflush(stdout);
+		_exit(124);
+	}
+	if (!client) {
+		if (getpid() != 2 || drop_to_system(drmrpc, 1) || install(p)) {
+			T3("FAIL client drop/seccomp errno=%d; client NOT started\n", errno);
+			fflush(stdout);
+			_exit(124);
+		}
+		T3("client exec %s %s uid=1000 groups=drmrpc pid=2 seccomp=client(%u insns)\n",
+		   target, arg, p->n);
+		fflush(stdout);
+		execl(target, argv0, arg, (char *)NULL);
+		T3("FAIL client exec errno=%d\n", errno);
+		fflush(stdout);
+		_exit(127);
+	}
+	_exit(child_status(client));
+}
+
 static int empty_ro_dir(const char *path)
 {
 	struct stat sb;
@@ -639,7 +849,6 @@ static int empty_ro_dir(const char *path)
 
 static int do_client(void)
 {
-	static const gid_t drmrpc[] = {1026};
 	const char *dir = "/dev/crownlte/t3-cns";
 	char empty[256], target[256], path[256];
 	struct t3_prog p;
@@ -698,13 +907,8 @@ static int do_client(void)
 		setrlimit(RLIMIT_CORE, &core);
 	}
 	close_extra_fds();
-	if (drop_to_system(drmrpc, 1) || install(&p))
-		goto fail;
-	T3("client exec %s %s uid=1000 groups=drmrpc seccomp=client(%u insns)\n", target, st->name, p.n);
-	fflush(stdout);
-	execl(target, st->client, st->name, (char *)NULL);
-	T3("FAIL client exec errno=%d\n", errno);
-	return 127;
+	/* Own pid namespace + fresh /proc: no other process is reachable. */
+	return client_pidns(target, st->client, st->name, &p, empty);
 fail:
 	T3("FAIL client namespace setup errno=%d; client NOT started\n", errno);
 	return 124;

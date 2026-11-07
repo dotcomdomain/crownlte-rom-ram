@@ -36,7 +36,7 @@ case "${TEE_T3:-}" in
 esac
 if [ -n "${TEE_T3:-}" ]; then
   test "${TEE_T2:-0}" = 1
-  cp "$SRC"/tee-t3-run.c "$SRC"/t3-seccomp-fixture.c .
+  cp "$SRC"/tee-t3-run.c "$SRC"/t3-seccomp-fixture.c "$SRC"/t3-pidns-fixture.c .
   cp -r "$SRC"/t3 .
 fi
 
@@ -121,10 +121,13 @@ if [ -n "${TEE_T3:-}" ]; then
   T3_DEFS=(-DT3_STAGE="\"$TEE_T3\"" -DT3_CLIENT_SHA="\"$T3_SHA\"")
   gcc -I. -O2 -Wall -Wextra -Werror -Wno-unused-function "${T3_DEFS[@]}" t3-seccomp-fixture.c -o t3-seccomp-fixture
   ./t3-seccomp-fixture | tee t3-seccomp-fixture.log
+  # Client /proc isolation for real (root; private mount ns twice over).
+  gcc -I. -O1 -Wall -Wextra -Werror -Wno-unused-function "${T3_DEFS[@]}" t3-pidns-fixture.c -o t3-pidns-fixture
+  unshare --mount --propagation private ./t3-pidns-fixture | tee t3-pidns-fixture.log
   aarch64-linux-gnu-gcc -static -Os -Wall -Wextra -Werror -I. "${T3_DEFS[@]}" tee-t3-run.c -o tee-t3-run
   cp tee-t3-run rootfs/crownlte/tee-t3-run
   cp t3-client rootfs/crownlte/t3-client
-  T3_SUMS=(tee-t3-run.c t3-seccomp-fixture.c t3/* bionic/libc.so bionic/libdl.so tee-t3-run t3-client)
+  T3_SUMS=(tee-t3-run.c t3-seccomp-fixture.c t3-pidns-fixture.c t3/* bionic/libc.so bionic/libdl.so tee-t3-run t3-client)
 fi
 chmod 0644 rootfs/crownlte/* rootfs/crownlte/sanitized/*
 chmod 0755 rootfs/crownlte/probe.sh rootfs/crownlte/init_user0.sh rootfs/crownlte rootfs/crownlte/sanitized

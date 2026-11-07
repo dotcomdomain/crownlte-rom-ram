@@ -66,11 +66,11 @@ for n in $(seq 1 60); do
     if logcat -b all -d -v brief 2>/dev/null | grep -q 'TEE is ready'; then ready=1; break; fi
 done
 case "$STAGE" in a2) want_loads=3 ;; b1) want_loads=1 ;; *) want_loads=0 ;; esac
-# Blob-path refusals (open-trustlet / admin-load-*) are fatal; UUID-path
-# (open-session / gp-open-session) refusals are the T2 guard working and are
-# reported, as in T2.
+# Blob-path refusals (open-trustlet / admin-load-* / (gp-)open-session-registry,
+# i.e. a blob the kernel was asked to map) are fatal; UUID-path (open-session /
+# gp-open-session) refusals are the T2 guard working and are reported, as in T2.
 blob_refusals() {
-    dmesg 2>/dev/null | grep 'tee session-guard' | grep REFUSED | grep -cE 'open-trustlet|admin-load'
+    dmesg 2>/dev/null | grep 'tee session-guard' | grep REFUSED | grep -cE 'open-trustlet|admin-load|open-session-registry'
 }
 session_refusals() {
     dmesg 2>/dev/null | grep 'tee session-guard' | grep REFUSED | grep -cE ' (gp-)?open-session '

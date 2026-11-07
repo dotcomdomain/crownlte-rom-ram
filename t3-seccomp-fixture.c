@@ -5,7 +5,13 @@
  *    refused except the exact list (+LOAD_DRIVER only when drivers are pinned);
  *  - client: exact 9-cmd user-node list (no OPEN_SESSION, GP or admin), only
  *    AF_UNIX/SOCK_DGRAM sockets, the deny list returns EPERM, the rest passes;
- *  - wrong arch kills. Built and run by build.sh for TEE_T3. */
+ *  - io_uring_setup/enter/register: ENOSYS for daemon and client (io_uring
+ *    ops such as IORING_OP_SOCKET would bypass the socket rule); client
+ *    clone3 ENOSYS, clone with any CLONE_NEW* flag EPERM, fork/thread/vfork
+ *    clone flags allowed;
+ *  - wrong arch kills. Built and run by build.sh for TEE_T3.
+ *  The client /proc isolation (pid namespace, fresh procfs) is exercised for
+ *  real by t3-pidns-fixture.c. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <string.h>
@@ -49,6 +55,19 @@ static uint32_t call(uint32_t arch, int nr, uint64_t a0, uint64_t a1)
 static int fails;
 #define EXPECT(cond, ...) do { if (!(cond)) { if (fails++ < 10) printf("FAIL " __VA_ARGS__); } } while (0)
 #define EPERM_RET (SECCOMP_RET_ERRNO | EPERM)
+#define ENOSYS_RET (SECCOMP_RET_ERRNO | ENOSYS)
+
+/* io_uring (IORING_OP_SOCKET/OPENAT/... bypass the filtered syscalls): ENOSYS */
+static void expect_no_io_uring(const char *name)
+{
+	static const int nr[] = {T3_NR_io_uring_setup, T3_NR_io_uring_enter, T3_NR_io_uring_register};
+
+	for (unsigned i = 0; i < 3; i++) {
+		EXPECT(call(AUDIT_ARCH_AARCH64, nr[i], 0, 0) == ENOSYS_RET, "%s io_uring nr %d\n", name, nr[i]);
+		EXPECT(call(AUDIT_ARCH_AARCH64, nr[i], 16, 0xffffffffffffffffull) == ENOSYS_RET,
+		       "%s io_uring nr %d args\n", name, nr[i]);
+	}
+}
 
 static void mspace(const char *name, const uint32_t *allow, unsigned n)
 {
@@ -84,7 +103,15 @@ int main(void)
 		T3_NR_unshare, T3_NR_bpf, T3_NR_init_module, T3_NR_finit_module, T3_NR_delete_module,
 		T3_NR_kexec_load, T3_NR_kexec_file_load, T3_NR_reboot, T3_NR_swapon, T3_NR_swapoff,
 		T3_NR_perf_event_open, T3_NR_process_vm_writev, T3_NR_open_by_handle_at,
-		T3_NR_socketpair, T3_NR_keyctl, T3_NR_add_key, T3_NR_request_key, T3_NR_mknodat};
+		T3_NR_socketpair, T3_NR_keyctl, T3_NR_add_key, T3_NR_request_key, T3_NR_mknodat,
+		/* S2: cross-process memory/fd, new mount API */
+		T3_NR_process_vm_readv, T3_NR_pidfd_open, T3_NR_pidfd_getfd, T3_NR_open_tree,
+		T3_NR_move_mount, T3_NR_fsopen, T3_NR_fsconfig, T3_NR_fsmount, T3_NR_fspick,
+		T3_NR_mount_setattr};
+	/* clone flags: fork (SIGCHLD), bionic pthread_create, posix_spawn vfork */
+	static const uint64_t clone_ok[] = {17, 0x3d0f00, 0x4111, 17 | 1ull << 32};
+	static const uint32_t clone_ns[] = {0x20000, 0x02000000, 0x04000000, 0x08000000,
+					    0x10000000, 0x20000000, 0x40000000};
 	/* aarch64: openat 56, close 57, read 63, write 64, mmap 222, clone 220, execve 221,
 	 * connect 203, getrandom 278, prctl 167, exit_group 94, futex 98 */
 	static const int passed[] = {56, 57, 63, 64, 222, 220, 221, 203, 278, 167, 94, 98};
@@ -97,6 +124,8 @@ int main(void)
 	mspace("daemon", daemon_allow, 12);
 	EXPECT(call(AUDIT_ARCH_AARCH64, T3_NR_ioctl, 3, MC_LOAD_DRIVER) == EPERM_RET, "daemon LOAD_DRIVER\n");
 	EXPECT(call(AUDIT_ARCH_AARCH64, T3_NR_mount, 0, 0) == SECCOMP_RET_ALLOW, "daemon other syscall\n");
+	EXPECT(call(AUDIT_ARCH_AARCH64, T3_NR_socket, 2, 1) == SECCOMP_RET_ALLOW, "daemon socket\n");
+	expect_no_io_uring("daemon");
 
 	/* daemon with pinned drivers: + LOAD_DRIVER, LOAD_CHECK still refused */
 	if (build_daemon_filter(&cur, 1))
@@ -105,6 +134,7 @@ int main(void)
 	mspace("daemon+drv", daemon_allow, 13);
 	EXPECT(call(AUDIT_ARCH_AARCH64, T3_NR_ioctl, 3, MC_LOAD_CHECK) == EPERM_RET, "daemon+drv LOAD_CHECK\n");
 	EXPECT(call(AUDIT_ARCH_AARCH64, T3_NR_ioctl, 3, MC_OPEN_TRUSTLET) == EPERM_RET, "daemon OPEN_TRUSTLET\n");
+	expect_no_io_uring("daemon+drv");
 
 	/* client */
 	if (build_client_filter(&cur))
@@ -132,6 +162,18 @@ int main(void)
 		EXPECT(call(AUDIT_ARCH_AARCH64, passed[i], 0, 0) == SECCOMP_RET_ALLOW, "client nr %d not allowed\n",
 		       passed[i]);
 	EXPECT(call(0xc000003e, T3_NR_socket, 1, 2) == SECCOMP_RET_KILL_PROCESS, "client x86\n");
+	/* S2: io_uring would open stream/INET sockets without socket() */
+	expect_no_io_uring("client");
+	EXPECT(call(AUDIT_ARCH_AARCH64, T3_NR_clone3, 0, 0) == ENOSYS_RET, "client clone3\n");
+	for (unsigned i = 0; i < sizeof(clone_ok) / sizeof(clone_ok[0]); i++)
+		EXPECT(call(AUDIT_ARCH_AARCH64, T3_NR_clone, clone_ok[i], 0) == SECCOMP_RET_ALLOW,
+		       "client clone %#llx\n", (unsigned long long)clone_ok[i]);
+	for (unsigned i = 0; i < sizeof(clone_ns) / sizeof(clone_ns[0]); i++) {
+		EXPECT(call(AUDIT_ARCH_AARCH64, T3_NR_clone, clone_ns[i] | 17, 0) == EPERM_RET,
+		       "client clone ns %#x\n", clone_ns[i]);
+		EXPECT(call(AUDIT_ARCH_AARCH64, T3_NR_clone, clone_ns[i] | 0x3d0f00, 0) == EPERM_RET,
+		       "client clone thread+ns %#x\n", clone_ns[i]);
+	}
 
 	printf("t3 seccomp fixture: %s (%d failures; insns daemon=%u daemon+drv=%u client=%u; 2^24 'M' cmds x3)\n",
 	       fails ? "FAIL" : "PASS", fails, sizes[0], sizes[1], sizes[2]);
